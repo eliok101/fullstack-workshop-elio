@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 FROM node:22.16.0-alpine AS dependencies
+RUN npm install -g npm@11.18.0
 WORKDIR /workspace
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 FROM dependencies AS development
 COPY . .
