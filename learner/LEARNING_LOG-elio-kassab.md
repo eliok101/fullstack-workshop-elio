@@ -129,6 +129,91 @@ The `[Vue] Resolve plugin path failed: vue-router/volar/sfc-route-blocks` warnin
 
 ---
 
+### Module 00 — Architecture sketch and boundary explanations
+
+**Date and branch**
+
+- Date: 2026-07-30
+- Branch: learning/00-orientation
+- Pull request: none yet
+
+**Evidence type**
+
+Module 00 step 1 ("draw the system from memory using five boxes: browser, Nuxt, FastAPI, PostgreSQL, Google Cloud delivery. Add arrows and state what travels over each boundary.") — required evidence item "architecture sketch with boundary explanations."
+
+**Sketch (drawn from memory, then corrected against `docs/architecture.md`)**
+
+```text
+[Browser] --HTTPS--> [Nuxt :3000] --REST/JSON--> [FastAPI :8000] --SQL--> [PostgreSQL :5432]
+                                                        |
+                                              [Google Cloud delivery]
+                                     (GitHub Actions --OIDC--> Artifact Registry,
+                                      Cloud Run, Cloud SQL, Secret Manager)
+```
+
+**Boundary explanations**
+
+- Browser → Nuxt (`:3000`, HTTPS): the browser's only network target; carries page requests and rendered HTML/hydration payloads.
+- Nuxt → FastAPI (`:8000`, REST/JSON): server-side Nuxt calls the backend over Docker DNS (`backend:8000`) locally, or the deployed API's Cloud Run URL in production; client-side calls hit the public API base. Carries JSON bodies and a Bearer token for authenticated routes.
+- FastAPI → PostgreSQL (`:5432`, SQL): carries SQL statements over a pooled connector; this is the only boundary that touches durable state.
+- **Correction from my first draft:** I originally drew Google Cloud delivery as a single branch hanging off FastAPI. Per the system context diagram in `docs/architecture.md`, that's not accurate — GitHub Actions authenticates to GCP via OIDC (no stored key JSON), pushes images to Artifact Registry, and from there **both** Cloud Run services deploy independently (`workboard-web` for Nuxt and `workboard-api` for FastAPI), alongside Cloud SQL being provisioned separately. It's a fan-out to all three runtime pieces, not a single downstream branch off the backend.
+- Secret Manager → FastAPI: database URL and signing key are injected into the backend at runtime (via Cloud Run environment), never baked into the image or passed as Docker build arguments.
+- Cloud Logging/Monitoring → Engineer: the observability feedback loop back to whoever is operating the system — not covered until Module 18, but it's the fifth real boundary in the full diagram.
+
+**Source verified against:** `docs/architecture.md` § System context (mermaid `flowchart LR`).
+
+**Definition-of-done evidence table**
+
+| Claim | How it's proven |
+|---|---|
+| A clean machine can run the application | git clone → make setup → make up → make ps shows db/backend/frontend all healthy |
+| A user cannot read another user's private project | Automated test: authenticated request for another user's private project returns 403/404 |
+| A database schema can be reproduced from zero | Run migrations against empty DB, confirm current revision matches expected via migration tool output |
+| Public project content exists in initial HTML | curl the public project page, grep response body for project content — before any client JS executes |
+| A failed pull request cannot merge | Push a commit that fails a required CI check, show GitHub blocks merge |
+| A known-good cloud revision can receive traffic again | Deploy a bad revision, shift Cloud Run traffic to the prior revision, confirm smoke check passes |
+
+**Work agreement (Step 4)**
+
+No mentor assigned for this self-paced run of the workshop; core hours, PR rules, AI-use policy, reference-access policy, cloud billing owner, and escalation path are not yet established. Will revisit if a mentor is assigned.
+
+**Baseline explanation (Step 5, answered without opening source files)**
+
+1. Why frontend and backend are separate production services: they scale, deploy, and fail independently — a frontend issue shouldn't take down the API and vice versa.
+2. Why PostgreSQL data is not stored in a container filesystem: containers are ephemeral and get destroyed/replaced; a named volume (or Cloud SQL in production) persists independently of container lifecycle.
+3. Why a migration job is different from application startup: migrations change schema and must run once, deliberately, not on every app boot — concurrent/multiple instances starting at once could cause conflicting schema changes.
+4. Why one green browser path is insufficient: it only proves one flow under one condition — not authorization boundaries, error states, or degraded-dependency behavior.
+5. Why rollback may fail after an incompatible database migration: if new code depends on a schema change, rolling back the code alone doesn't undo the schema — old code can break against the new schema.
+
+Uncertainty: none flagged — I feel confident on all five after discussion, though I'd want to actually see the failure-mode behaviors in modules 04-09 to confirm this holds up in practice, not just in explanation.
+
+**Independent challenge — miniature definition-of-done for "delete a project"**
+
+1. API contract: DELETE /api/projects/{project_id}. Success: 204 No Content. Failure: 401 (not authenticated), 403 (not the owner), 404 (project doesn't exist), 500 (server error).
+
+2. Authorization: only the project owner can delete it. Backend checks the user is authenticated and that the user's ID matches the project's owner. (Note: this app doesn't have an admin role per docs/architecture.md's deliberate omissions, so admin override is a future extension, not part of base scope.)
+
+3. Persistence: soft delete via a deleted_at column rather than hard delete, so projects are recoverable. Tasks belonging to the project are hidden/marked deleted alongside it.
+
+4. Migration impact: yes if soft delete is used — a migration adds `deleted_at TIMESTAMP NULL` to the projects table. No schema change needed if hard delete were used instead.
+
+5. Frontend states: confirmation dialog before deleting; loading spinner and disabled delete button during the request; success message + redirect to the projects list after; error message with the project still visible if deletion fails.
+
+6. Tests: create a project, send DELETE, assert 204, assert the project no longer appears in the project list.
+
+7. Logs: project ID, user ID, username, timestamp, result (success/failed). Example: "User 15 deleted Project 42 at 2026-07-30 09:45 UTC."
+
+8. Rollback: disable via feature flag or redeploy the previous app version; soft-deleted projects can be restored from the database if the feature caused unwanted deletions.
+
+**Self-rating**
+
+- I can repeat this with notes: 5/5
+- I can explain it without the reference code: 4/5
+- I can diagnose one failure in this area: 4/5
+- Confidence from 1–5: 4
+
+---
+
 ## Module entry template
 
 ### Module NN — title
