@@ -214,6 +214,94 @@ Uncertainty: none flagged — I feel confident on all five after discussion, tho
 
 ---
 
+### Module 01 — Workstation and repository setup
+
+**Date and branch**
+
+- Date: 2026-07-30
+- Branch: learning/01-setup
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Verify the local toolchain with exact version evidence, confirm `.env` stays untracked and understand why `.gitignore` and `.dockerignore` solve different problems, start the stack and interpret health/liveness vs readiness, and diagnose a deliberate database failure.
+
+**Work completed so far**
+
+- Verified tool versions: git 2.55.0, Docker 29.6.1, Docker Compose v5.3.0, running on Windows 10.0.26200 via Git Bash/MSYS.
+- Confirmed `gcloud`, `terraform`, and `gh` are not installed yet — not needed until modules 16-17, noted as a workstation gap to close later.
+- Checked `docker info` for resource usage (images, containers, volumes, build cache).
+- Confirmed `git status` clean, remote correctly set to `eliok101/fullstack-workshop-elio`, and `.env` confirmed ignored via `git check-ignore -v .env` (matched at `.gitignore:1`).
+- Reviewed `.gitignore`, `.dockerignore` (root, and noted it's per-service in practice via `backend/.dockerignore` and `frontend/.dockerignore`), and `.env.example`.
+
+**`.gitignore` vs `.dockerignore` explanation**
+
+Although .gitignore and .dockerignore may exclude some of the same files, they serve different purposes.
+
+.gitignore tells Git which files and folders should not be tracked or committed to the repository. This keeps the project history clean by excluding generated files, dependencies, caches, and sensitive information such as .env files. For example, node_modules/, .pytest_cache/, coverage/, and .env are excluded because they are either large, automatically generated, or contain secrets.
+
+.dockerignore tells Docker which files should not be sent to the Docker build context when creating an image. This reduces build time, keeps images smaller, and prevents unnecessary or sensitive files from being included in image layers. For example, .git/ is excluded because the project's Git history is not needed inside the container, and .env is excluded to prevent local secrets from being copied into the image.
+
+Some files, such as .env and node_modules/, appear in both files, but for different reasons. Git ignores them to keep the repository clean and secure, while Docker ignores them to improve build performance and avoid including unnecessary or sensitive files in the container image.
+
+A file being ignored by Git does not mean Docker will ignore it, and a file ignored by Docker does not mean Git will ignore it. Each file only affects its own tool, which is why important files like .env should be listed in both .gitignore and .dockerignore.
+
+Note there's also a `.dockerignore` per service (`backend/.dockerignore`, `frontend/.dockerignore`) — this root one is separate and would only apply if something built from repo root as its Docker context, which nothing in `compose.yaml` currently does (both `backend` and `frontend` builds use their own subdirectory as context).
+
+**Workstation observation**
+
+Two local clones of this repository existed on this machine: the canonical one at `C:\Users\Elio\fullstack-workshop-elio` (all work happens here) and a stale one under OneDrive at `C:\Users\Elio\OneDrive\Documents\Github\fullstack-workshop-elio` (still on `main`, no fixes applied). The OneDrive copy was a risk for confusion and potential OneDrive-sync conflicts with Docker bind mounts. Before removing it, confirmed via `git fetch` that its one extra commit (`2d930b9 delete the alpine`) was already pushed to `origin/main` and its only untracked content (`.vscode/settings.json`) was empty — nothing unique was lost by deleting it.
+
+**Controlled failure drill — database outage**
+
+Prediction (made before running): stopping only the database would leave `/health/live` returning 200 (no DB dependency), while `/health/ready` would fail, since it verifies real database connectivity.
+
+Evidence:
+
+- `docker compose stop db`
+- `curl -i http://localhost:8000/health/live` → `HTTP/1.1 200 OK` `{"status":"alive"}`
+- `curl -i http://localhost:8000/health/ready` → `HTTP/1.1 503 Service Unavailable` `{"detail":"database unavailable"}`
+- `docker compose start db` → db back to healthy within ~1 minute
+- `curl --fail http://localhost:8000/health/ready` → `{"status":"ready"}`, exit 0
+
+Explanation: liveness only confirms the FastAPI process itself is running and responsive, with no dependency on the database — this matches why liveness should not fail during a temporary dependency outage (a process restart wouldn't fix a database outage, so failing liveness here would cause unnecessary, useless container restarts). Readiness performs a live database connection check each time it's called, which is why it failed immediately when the database stopped and recovered automatically the moment the database became healthy again, with no manual backend restart needed — confirming this is a live check, not a cached state.
+
+**Runtime identity check**
+
+- `docker compose exec backend whoami` → `app` (non-root)
+- `docker compose exec frontend whoami` → `root`
+- `docker compose exec backend python --version` → `Python 3.13.5`
+- `docker compose exec frontend node --version` → `v22.16.0`
+- Noted: backend dev container already runs non-root, matching production; frontend dev container runs as root, with only its separate production stage switching to non-root. This dev/prod asymmetry is expected per the module's own guidance to defer the production-user proof to Module 04.
+
+**Workstation gap noted**
+
+`make` is not on PATH in this Git Bash session (`make ps` returned "command not found", exit 127); `docker compose` commands used directly as a substitute. Worth resolving before relying on make-based commands in later modules.
+
+**Independent challenge — Postgres port override**
+
+The `db` service originally had no `ports:` block at all — Postgres was only reachable on the internal Compose network at `db:5432`, never exposed to the host.
+
+Steps:
+
+1. Added `ports: ["${POSTGRES_PORT:-5432}:5432"]` to the `db` service in `compose.yaml`.
+2. Set `POSTGRES_PORT=5433` in `.env`.
+3. Restarted the stack (`docker compose down && docker compose up -d`).
+4. `docker compose ps` confirmed `db` now bound to `0.0.0.0:5433->5432/tcp`.
+5. `curl --fail http://localhost:8000/health/ready` still returned `{"status":"ready"}`, exit 0.
+6. Removed `POSTGRES_PORT` from `.env`, restarted again, confirmed `db` returned to `0.0.0.0:5432->5432/tcp` (via `compose.yaml`'s `${POSTGRES_PORT:-5432}` default fallback) and all services healthy.
+
+Proof: backend's `DATABASE_URL` uses `db:5432` (Docker service DNS name + internal container port), which is completely independent of whatever host port is mapped to reach Postgres from outside Docker. Changing the host-side port (5432 → 5433 → back to 5432) had zero effect on backend-to-database connectivity, since container-to-container traffic on the Compose network never touches the host port mapping at all — that mapping only matters for connections originating from outside Docker (e.g. a local psql client or GUI tool).
+
+**Self-rating**
+
+- I can repeat this with notes: yes - with my notes, I can repeat the module, explain each step, and reproduce the setup and verification process.
+- I can explain it without the reference code: yes - liveness checks whether the application is running, readiness checks whether it's ready to serve requests (including dependencies like the database), and port mapping connects a port on the host machine to a port inside the Docker container.
+- I can diagnose one failure in this area: mostly yes - I could use Docker commands, container logs, health endpoints, and process of elimination to identify which service is failing, though I might still need documentation for more complex or unfamiliar issues.
+- Confidence from 1–5: 4/5 - I understand the concepts and can perform the module independently, but I'd like more practice troubleshooting different failure scenarios before considering myself fully confident.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
