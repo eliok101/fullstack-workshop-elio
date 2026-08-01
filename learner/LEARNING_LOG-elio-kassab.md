@@ -352,6 +352,35 @@ Fix: deleted `frontend/package-lock.json`, regenerated it fresh against the new 
 
 Lesson: a silently auto-merged file (no conflict markers) is not automatically safe just because Git resolved it without complaint — a lockfile's correctness depends on the environment it's regenerated against, and textual merging can produce a file that is syntactically valid but semantically wrong for the new context.
 
+**Independent challenge — git bisect**
+
+Set up a 6-commit practice history on a throwaway branch (`scratch/bisect-practice`, branched off `main`, isolated from real work) where a text assertion (`status: ready`) flips to something else (`status: pending`) partway through and stays broken.
+
+Commands run:
+
+```text
+git bisect start
+git bisect bad HEAD
+git bisect good eba36a2
+```
+
+Then, at each checkout, inspected `bisect-scratch.txt` for the status line and reported good/bad based on what was actually there:
+
+- Checkout 1 (`e20580b`, commit 3/6): showed `status: pending` → reported bad
+- Checkout 2 (`7da7bfb`, commit 2/6): showed `status: ready` → reported good
+- Result: `e20580b` identified as the first bad commit — correct, in 2 checks instead of manually inspecting all 6 commits.
+
+`git bisect reset` used to return to normal branch state afterward.
+
+Lesson: bisect uses binary search, not linear scanning — with 6 commits it took 2 checks to isolate the exact point of breakage, and the number of checks needed grows logarithmically (not linearly) with history size, which matters a lot on a real project history with hundreds or thousands of commits.
+
+**Self-rating**
+
+- I can repeat this with notes: 4/5 - understand branching, selective staging, opening a PR, resolving merge conflicts by intent (not just picking a side), and the git bisect workflow. Would likely glance at the exact bisect command sequence if not used recently.
+- I can explain it without the reference code: 5/5 - comfortable explaining the Git state model (working tree → staging area → local commit → remote branch), why merge conflicts happen, how to inspect both sides, and why resolving first then refactoring separately matters.
+- I can diagnose one failure in this area: 4/5 - confident working through a similar merge conflict independently by reading both versions and testing the result. For bisect, understand the workflow and could perform one, possibly double-checking exact command syntax.
+- Confidence from 1–5: 4/5 - this module was more conceptually demanding than Modules 00/01 since it required understanding Git's mental model, not just running commands. Bisect is the area needing the most additional hands-on repetition, simply due to lower frequency of use compared to branching/staging/conflict resolution.
+
 ---
 
 ## Module entry template
