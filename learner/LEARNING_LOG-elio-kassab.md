@@ -381,6 +381,12 @@ Lesson: bisect uses binary search, not linear scanning — with 6 commits it too
 - I can diagnose one failure in this area: 4/5 - confident working through a similar merge conflict independently by reading both versions and testing the result. For bisect, understand the workflow and could perform one, possibly double-checking exact command syntax.
 - Confidence from 1–5: 4/5 - this module was more conceptually demanding than Modules 00/01 since it required understanding Git's mental model, not just running commands. Bisect is the area needing the most additional hands-on repetition, simply due to lower frequency of use compared to branching/staging/conflict resolution.
 
+**Review and merge**
+
+Step 5 (read checks and review comments) and formal review in Step 8: no CI checks are currently configured on this repo to inspect, and no mentor was assigned to formally review this PR — same gap noted in Module 00's work agreement section. PR #1 was self-reviewed against the validation checklist, converted from draft, and merged directly as the repo owner. Merge confirmed clean with no conflicts against main.
+
+(This final note itself was pushed directly to main rather than through another PR, since it's a trivial reflective addition - a reasonable exception in most workflows, though worth flagging as not strictly following this module's own branch-per-change practice.)
+
 ---
 
 ## Module entry template
