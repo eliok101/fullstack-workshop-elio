@@ -8,6 +8,8 @@ This is **both a software project and a curriculum**. It is the learner starter 
 
 The starter is **deliberately incomplete** — see `STARTER_SCOPE.md`. There is no auth, no users/projects/tasks domain, no migrations, and no production-grade test suites yet; those are the graded learning outcomes of modules 03–18. Do not "complete" the app by copying in a full reference implementation — module-sized, explained, tested changes are the point.
 
+Learner: Elio Kassab, currently on Module 02.
+
 Full instructions for coding agents working in this repo are in `AGENTS.md` — read it before making non-trivial edits. Key rules from it:
 
 - Identify whether a change affects the reference solution, starter snapshot, course text, CI, or cloud runbooks *before* editing.
