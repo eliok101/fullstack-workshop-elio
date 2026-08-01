@@ -302,6 +302,37 @@ Proof: backend's `DATABASE_URL` uses `db:5432` (Docker service DNS name + intern
 
 ---
 
+### Module 02 — Git, GitHub, and pull requests
+
+**Date and branch**
+
+- Date: 2026-08-01
+- Branch: learning/02-git-workflow
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Use branches, commits, remotes, pull requests, and reviews as a controlled change workflow; write focused commits; resolve a merge conflict; understand required checks and force-push policy.
+
+**Work completed so far**
+
+- Confirmed git identity (fixed a typo in `user.email` from `eliokssab289@gmail.com` to `eliokassab289@gmail.com` — note this only applies going forward, prior commits keep the original address).
+- Reviewed `git log`/remote state, discovered the `upstream` remote points to `FadiZahhar/fullstack-workshop-ogilvy` — the instructor's original template this repo was forked from, explaining an earlier mix-up where that repo appeared unexpectedly in a browser tab.
+- Created branch `learning/02-git-workflow` from `learning/01-setup`.
+
+**Git state model, in my own words**
+
+- Working tree = the actual files on your machine that you are editing right now.
+- Staging area (index) = a "waiting room" where you choose which changes should go into the next commit (using `git add`).
+- Local commit = a snapshot of your staged changes, saved in your local Git history (only on your machine, not shared yet).
+- Remote branch = the version of your branch that lives on a remote repository (like GitHub). Other people can see it, and you update it using `git push`.
+
+Flow: you edit files (working tree) → you select what to include via `git add` (staging area) → you save a version via `git commit` (local commit) → you share it via `git push` (remote branch).
+
+Practicing selective staging in Step 3.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
