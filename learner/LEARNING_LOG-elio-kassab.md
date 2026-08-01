@@ -331,6 +331,27 @@ Flow: you edit files (working tree) → you select what to include via `git add`
 
 Practicing selective staging in Step 3.
 
+**Pull request opened**
+
+Draft PR #1 opened: https://github.com/eliok101/fullstack-workshop-elio/pull/1
+"Learning/02 git workflow" — learning/02-git-workflow into main, 6 commits.
+Note: GitHub's default compare view initially pointed at the wrong base repository (FadiZahhar/fullstack-workshop-ogilvy, the upstream template this repo was forked from) rather than eliok101/fullstack-workshop-elio — caught and corrected before creating the PR by navigating directly.
+Note: GitHub reports "Can't automatically merge" against main — a real merge conflict exists, which will be used for this module's Step 6 conflict-resolution exercise instead of manufacturing one.
+
+**Merge conflict resolution — Step 6**
+
+Conflict: rebasing `learning/02-git-workflow` onto `origin/main` hit a real conflict in `frontend/Dockerfile`. `origin/main`'s commit `2d930b9` "delete the alpine" switched the base image from `node:22.16.0-alpine` to `node:22.16.0` (Debian/glibc) and updated `addgroup`/`adduser` flags accordingly (`-S`/`-G` for BusyBox/Alpine → `-r`/`-g` for Debian/glibc). My branch's commit had kept `-alpine` and added a pin (`npm install -g npm@11.18.0`) to fix an earlier npm arborist bug.
+
+Resolution decision: adopted main's base image change (main is the source of truth for project direction) while keeping my npm pin as a safety net rather than assuming the base image switch alone fixed the original bug — a decision to verify empirically rather than assume, and to resolve the conflict first before considering any cleanup/simplification separately.
+
+Verification uncovered a second, deeper problem: `frontend/package-lock.json` auto-merged silently during the rebase (no conflict markers), but its `libc` metadata (glibc vs musl entries for the `oxc-parser` native binding) ended up inconsistent with the new base image. The Docker build itself succeeded (installing packages doesn't validate that native bindings actually load), but the frontend container crash-looped at runtime with `"Cannot find module '@oxc-parser/binding-linux-x64-gnu'"` — because the lockfile still resolved the wrong platform variant.
+
+This is a concrete example of why "the build succeeded" and "the system actually works" are different claims — the build error would never have surfaced without a real `docker compose up` and a runtime health check, not just a Docker image build.
+
+Fix: deleted `frontend/package-lock.json`, regenerated it fresh against the new (Debian/glibc) base image via `docker compose run --rm frontend npm install`, rebuilt `--no-cache`, and re-verified all four endpoints (backend live, backend ready, frontend `/api/health`, frontend homepage) all returned 200 with correct content.
+
+Lesson: a silently auto-merged file (no conflict markers) is not automatically safe just because Git resolved it without complaint — a lockfile's correctness depends on the environment it's regenerated against, and textual merging can produce a file that is syntactically valid but semantically wrong for the new context.
+
 ---
 
 ## Module entry template
