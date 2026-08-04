@@ -633,6 +633,71 @@ Note: production output is compact JSON (`{"status":"ready"}`, 18 bytes) versus 
 
 Both containers stopped and removed after testing.
 
+**Step 5 - Build cache behavior**
+
+`docker build --target production -t workboard-backend:cache-test backend` (baseline, identical content to `workboard-backend:module04`) → fully cached, `real 0m5.708s`, every layer including `COPY` and `pip install` shows `CACHED`.
+
+Test 1 - trivial change to a late (non-manifest) file (`backend/app/main.py`, added a comment): rebuild → `COPY` layer cache miss (0.2s) → `pip install` layer cache miss, full reinstall, `RUN` step `DONE 76.7s`, total `real 1m30.442s`. Reverted the file, confirmed `git diff`/`git status` clean before the next test.
+
+Test 2 - trivial change to the dependency manifest only (`backend/pyproject.toml`, added a comment, `app/main.py` reverted first to isolate the variable): rebuild → `COPY` layer cache miss again → `pip install` layer cache miss again, full reinstall, `RUN` step `DONE 97.5s`, total `real 1m56.364s`. Reverted the file, confirmed `backend/` fully clean afterward (`git diff --stat` and `git status --short` both empty).
+
+Key finding: `backend/Dockerfile`'s production stage does `COPY --chown=app:app . .` (entire context in one instruction) immediately before `RUN pip install --no-cache-dir .` - there's no separate manifest-first copy step. This means ANY file change in the build context invalidates both the `COPY` layer and the `pip install` layer together, with no way to change application code alone without forcing a full dependency reinstall.
+
+Contrast with `frontend/Dockerfile`'s `dependencies` stage, which does `COPY package.json package-lock.json ./` before `RUN npm ci`, and only copies full source in later stages - so a frontend source-only change does NOT force `npm ci` to rerun, while a backend source-only change always does. This is a real, asymmetric cost between the two Dockerfiles: frontend benefits from dependency-layer caching on every source edit, backend does not.
+
+Follow-up worth raising (not implemented, flagged only): `backend/Dockerfile` could adopt the same pattern - `COPY pyproject.toml` (and any lock file) first, run `pip install`, then `COPY` the rest of the source - to get the same dependency-layer caching benefit frontend already has.
+
+**Step 6 - Build context and exclusions**
+
+Root `.dockerignore`:
+
+```text
+.git
+.env
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/node_modules
+**/.nuxt
+**/.output
+**/coverage
+```
+
+`backend/.dockerignore`:
+
+```text
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+.coverage
+htmlcov
+```
+
+`frontend/.dockerignore`:
+
+```text
+node_modules
+.nuxt
+.output
+coverage
+npm-debug.log*
+```
+
+Reasoning per category (based on the actual files above, and which `.dockerignore` actually governs each build - `compose.yaml` sets `context: ./backend` / `context: ./frontend`, so only the subdirectory-local `.dockerignore` files apply to those builds, not the root one):
+
+- `.git`: only listed in the root `.dockerignore`, not in either subdirectory one. Doesn't matter in practice - `.git` lives at the repo root, outside both `backend/` and `frontend/` build contexts, so it's excluded structurally rather than by an applicable rule.
+- `.env`: same situation - only the root file lists it, and `.env` lives at the repo root, outside both build contexts. Latent gap: if a per-service `backend/.env` or `frontend/.env` were ever introduced, neither subdirectory `.dockerignore` currently has a rule that would catch it.
+- Test artifacts: properly excluded via the files that actually matter - `backend/.dockerignore` lists `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.coverage`, `htmlcov`; `frontend/.dockerignore` lists `coverage`.
+- `node_modules`: correctly excluded via `frontend/.dockerignore`'s explicit entry - the file that actually governs the frontend build context.
+- Terraform state: not excluded by any rule in any of the three files (none contain `*.tfstate`, `*.tfvars`, or `.terraform`). Moot today since `infrastructure/gcp/terraform/` is never used as a Docker build context for anything in `compose.yaml` - excluded structurally (out of scope entirely), not by policy. Same latent-gap pattern as `.env`: nothing would actually stop it if root ever became a build context.
+
+Note: `scripts/check-secrets.sh`, referenced in this module's lab instructions and in `docs/security.md` as "a basic local guard," does not currently exist in this repository - confirmed by directory listing (`scripts/` only contains `setup.sh` and `validate-starter.py`). This step of the lab could not be executed as written; flagged as a gap between the module's assumptions and the actual starter state, rather than skipped silently.
+
 ---
 
 ## Module entry template
