@@ -389,6 +389,139 @@ Step 5 (read checks and review comments) and formal review in Step 8: no CI chec
 
 ---
 
+### Module 03 — HTTP, REST, JSON, and API contracts
+
+**Date and branch**
+
+- Date: 2026-08-03
+- Branch: learning/03-api-contracts
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Decompose HTTP requests/responses into their components, choose status codes based on semantics, exercise the API manually, and build an error matrix distinguishing 401/403/404/409/422.
+
+**Work completed so far**
+
+Step 1: attempted `curl --fail http://localhost:8000/openapi.json` and `GET /api/v1/status` — both returned 404, confirming the backend currently only exposes `/health/live` and `/health/ready`. No API contract exists yet; this is the expected starting state per `STARTER_SCOPE.md`, not a bug — "completed API contracts" are exactly what this module and the ones following it build.
+
+Step 2 — traced a real request/response with `curl -v` against `/health/live`:
+
+```text
+* Host localhost:8000 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+*   Trying [::1]:8000...
+* Established connection to localhost (::1 port 8000) from ::1 port 57068
+* using HTTP/1.x
+> GET /health/live HTTP/1.1
+> Host: localhost:8000
+> User-Agent: curl/8.21.0
+> Accept: */*
+>
+* Request completely sent off
+< HTTP/1.1 200 OK
+< date: Mon, 03 Aug 2026 13:38:04 GMT
+< server: uvicorn
+< content-length: 18
+< content-type: application/json
+<
+* Connection #0 to host localhost:8000 left intact
+{"status":"alive"}
+```
+
+Transport-level lines (about the TCP connection, not HTTP semantics): host resolution, IPv6/IPv4 addresses tried, connection establishment, "Request completely sent off", "Connection left intact".
+
+Application-level lines (actual HTTP semantics): the request line (`GET /health/live HTTP/1.1`), request headers (`Host`, `User-Agent`, `Accept`), the status line (`HTTP/1.1 200 OK`), response headers (`date`, `server`, `content-length`, `content-type`), and the response body (`{"status":"alive"}`).
+
+Noise (curl's own UI, not HTTP): the percentage progress-meter rows and the `{ [18 bytes data] }` placeholder line.
+
+Note: curl resolved both IPv6 (`::1`) and IPv4 (`127.0.0.1`) for `localhost` but connected over IPv6 first, successfully — worth being precise about which protocol was actually used rather than assuming IPv4 by default.
+
+Note: no CORS or security-related headers (`Content-Security-Policy`, `Access-Control-Allow-Origin`) are present, which is expected for a same-origin health check with no cross-origin or auth concerns at this stage.
+
+Step 3 - attempted to exercise authentication manually:
+
+- `curl -i -X POST http://localhost:8000/api/v1/auth/register` (with a valid registration body) → `404 Not Found`, `{"detail":"Not Found"}`
+- `curl -i -X POST http://localhost:8000/api/v1/auth/login` (with valid form-encoded credentials) → `404 Not Found`, `{"detail":"Not Found"}`
+
+Both expected: `STARTER_SCOPE.md` explicitly lists authentication/JWT implementation as deliberately absent from the starter (built in Module 08). Since no token can be obtained, Steps 3 onward that require authentication (exercising `/auth/me`, creating projects/tasks, the cross-user privacy independent challenge) cannot be executed against real endpoints yet.
+
+Important distinction for the error matrix (Step 4): this 404 is produced by FastAPI/Starlette's routing layer itself (no matching route exists at all), which is a different case from a resource-scoped 404 an application handler would deliberately return (e.g. "this project exists but isn't yours to see"). Same status code, different origin and meaning — worth capturing this distinction explicitly in the matrix rather than treating all 404s as equivalent.
+
+**Step 4 - Status/error matrix**
+
+Scenario A: Project creation (POST /api/v1/projects)
+
+| Condition | Status | Reasoning |
+|---|---|---|
+| Valid request | 201 | Successful creation |
+| Missing required field | 422 | FastAPI validation error, not a generic 400 |
+| Malformed type/enum | 422 | Same validation layer as missing fields |
+| No token | 401 | Not authenticated |
+| Invalid/expired token | 401 | Same as no token - authentication problem, not authorization |
+| Duplicate project name/slug | 409 | Conflict with existing state |
+
+Scenario B: Task status transition (PATCH /api/v1/projects/{id}/tasks/{id})
+
+| Condition | Status | Reasoning |
+|---|---|---|
+| Valid transition | 200 | Successful update, not a new resource so not 201 |
+| Invalid transition (e.g. backlog to done) | 409 | Conflict with current resource state, stable code "invalid_transition" per api-contract.md |
+| No token | 401 | Not authenticated |
+| Project/task doesn't exist | 404 | Genuinely missing resource |
+| Project exists but not accessible to this user | 404 (resource-scoped), not 403 | Corrected from my first attempt - api-contract.md explicitly prefers a resource-scoped 404 over 403 here to avoid confirming a private project's existence to an unauthorized user. This is the exact behavior the Step 7 independent challenge (cross-user privacy) will verify empirically. |
+| Malformed status value (e.g. "in-progress" with hyphen) | 422 | Validation error |
+
+Self-correction note: initially answered 403 for "project exists but not accessible" - the actual contract prefers 404 specifically to prevent leaking whether a private resource exists at all to someone who shouldn't have access. This is one of the most important security-by-design lessons in this module.
+
+**Step 5 - Idempotency and retry implications**
+
+| Operation | Idempotent? | Reasoning |
+|---|---|---|
+| GET /projects (repeated) | Yes | Read-only, also a "safe" method - no state change at all |
+| POST /projects (repeated, same body) | No | Each call can create a new project - repeating is dangerous, not just redundant |
+| PATCH /tasks/{id} (repeated, same body) | Yes, for this specific case | Setting a field to an explicit absolute value (e.g. status: "in_progress") gives the same end state no matter how many times it's repeated. Note PATCH is not idempotent by the HTTP spec in general (e.g. "increment by 1" via PATCH would not be) - this is about this specific update pattern, not a blanket property of PATCH. |
+| DELETE /tasks/{id} (repeated after deletion) | Yes | The resource ends up in the same state (gone) regardless of repeat count, even though the response status code may differ between calls (e.g. 204 then 404) - idempotency is about resource state, not identical responses. |
+
+Practical retry implication: a client can safely auto-retry GET, PATCH (of this kind), and DELETE after a network failure without worrying about side effects, but should not blindly auto-retry POST - a lost response after a successful POST could result in duplicate resource creation on retry. This is why some production APIs (e.g. payment systems) use a client-generated idempotency key even for POST, letting the server recognize and deduplicate a retried request that isn't naturally idempotent by method alone.
+
+**Step 6 - Task filtering contract proposal**
+
+Proposed endpoint: `GET /api/v1/projects/{project_id}/tasks?status=in_progress&priority=high`
+
+1. Parameter validation: `status` and `priority` are enum-like fields. An invalid value (e.g. `?status=invalid_value`) should return `422 Unprocessable Content`, rejected at validation before reaching business logic.
+
+2. Combination behavior: multiple filters combine with AND logic (narrowing results), not OR - consistent with typical filter-UI conventions. OR-style matching (e.g. multiple statuses at once) would need an explicit different syntax, such as a comma-separated value.
+
+3. Empty result: a valid query that matches no tasks returns `200 OK` with an empty list (`[]`), not an error - "no results" is a normal successful outcome, not a failure.
+
+4. Pagination (future-proofing): reserve `limit` and `offset` (or `page`/`page_size`) query parameters for future use, with sensible defaults (e.g. `limit=50`) so existing clients calling the endpoint without these params remain unaffected - required for backward compatibility.
+
+5. Index implications: add a database index on `status` and `priority` individually, or a composite index on `(status, priority)` if both are commonly filtered together. Composite index column order should match the most common query pattern, since a `(status, priority)` index speeds up status-only or status+priority queries efficiently, but not priority-only queries.
+
+6. Required updates when adding this: OpenAPI documentation (new query parameters appear in the docs), frontend TypeScript types/API client, and tests covering: valid filter combinations, invalid enum values (expecting 422), multiple filters together (AND behavior), empty results (200 with []), and existing/pre-filter tests to confirm backward compatibility is preserved.
+
+**Step 7 - Independent challenge (cross-user private project access)**
+
+Blocked: this challenge requires creating two real user accounts, authenticating as each, and making direct API calls to prove a private project owned by user A cannot be read by user B. Since `/api/v1/auth/register` and `/api/v1/auth/login` return 404 (confirmed in Step 3 - authentication is deliberately absent from the starter per `STARTER_SCOPE.md`, built in Module 08), no real token can currently be obtained, so this cannot be executed against the live API yet.
+
+Documented expected behavior instead (to verify empirically once Module 08 is complete):
+
+1. Create user A, create a private project as user A (`is_public: false`) → 201.
+2. Create user B, authenticate as user B.
+3. As user B, `GET /api/v1/projects/{project_id}` for user A's private project.
+4. Expected: `404 Not Found` (resource-scoped), not `403` - per the Step 4 matrix decision, this avoids confirming to user B that the private project exists at all.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - can trace requests, apply HTTP status code semantics (200/201/401/403/404/409/422), build an error matrix by systematically asking about success/validation/auth/authorization/existence/conflict for each endpoint, reason about idempotency, and design a new filtered endpoint with pagination, indexing, and doc/test implications in mind.
+- I can explain it without the reference code: yes - can explain what each status code communicates, and specifically the resource-scoped 404 pattern (returning 404 instead of 403 for inaccessible-but-existing resources, to avoid confirming their existence to unauthorized users).
+- I can diagnose one failure in this area: yes, with moderate confidence - comfortable choosing status codes, building error matrices, reasoning about idempotency, and designing filter/pagination behavior. Would still want to verify project-specific conventions for more advanced security, caching, or concurrency decisions.
+- Confidence from 1–5: 4/5 - solid grasp of general HTTP/API design concepts; the main ongoing area for reinforcement is remembering project-specific conventions (e.g. this project's use of 422 for validation, and when it prefers resource-scoped 404 over 403) rather than the underlying concepts themselves.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
