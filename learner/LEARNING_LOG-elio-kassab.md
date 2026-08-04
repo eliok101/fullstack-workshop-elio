@@ -583,6 +583,56 @@ Second finding: frontend's production image is over 5x larger than backend's, bu
 
 Follow-up worth raising: switching the production stage's base to `node:22.16.0-slim` (still Debian/glibc, avoiding whatever motivated dropping Alpine in the first place, but far smaller) would likely recover most of this size difference without reintroducing the original Alpine/musl-related bug from Module 02. Not fixed as part of this module - flagged as a discovered opportunity, not implemented, since Module 04's lab step doesn't ask for base image optimization and this deserves its own reviewed change.
 
+**Step 3 - prove runtime identity**
+
+`docker run --rm --entrypoint whoami workboard-backend:module04` → `app`
+`docker run --rm --entrypoint id workboard-backend:module04` → `uid=999(app) gid=999(app) groups=999(app)`
+`docker run --rm --entrypoint whoami workboard-frontend:module04` → `app`
+`docker run --rm --entrypoint id workboard-frontend:module04` → `uid=100(app) gid=102(app) groups=102(app)`
+
+Both confirmed non-root, matching the security model's "production images run as non-root users" requirement.
+
+Note: UID/GID values differ between images (999/999 backend vs. 100/102 frontend) because `useradd`/`groupadd --system` (backend, shadow-utils) and `adduser`/`addgroup --system` (frontend, Debian's wrapper) allocate system IDs from different ranges. Not an issue today since the containers don't share volumes, but would matter for file-ownership consistency if a shared bind mount were ever introduced.
+
+Why non-root reduces impact but is not a complete sandbox:
+
+A compromised process running as the non-root `app` user could still: read/modify files the `app` user has permission to access (including runtime secrets like the database URL and signing key, since the process needs to read them to function), make outbound network requests to any service the container can reach, and consume CPU/memory/disk (denial of service).
+
+What non-root prevents: modifying root-owned system files, installing system packages, binding to privileged ports (<1024) without extra capabilities, and gaining control of the host simply by being inside the container.
+
+Conclusion: non-root is one layer of defense-in-depth, not complete isolation - it limits blast radius but doesn't eliminate risk, which is why the security model also relies on scoped secret access (Secret Manager granting only specific secrets to the runtime service account), rather than depending on container user permissions alone to protect sensitive values.
+
+**Step 4 - run an isolated liveness process and inspect**
+
+Backend, run standalone with a fake/unreachable database URL (no real DB dependency needed for liveness):
+
+```text
+docker run -d --name module04-backend-test -p 8001:8000 -e DATABASE_URL="postgresql+psycopg://placeholder:placeholder@nonexistent:5432/placeholder" workboard-backend:module04
+```
+
+`curl -i http://localhost:8001/health/live` → `HTTP/1.1 200 OK`, `{"status":"alive"}`
+
+Confirms liveness has no database dependency, exactly as designed and previously verified in Module 01's database failure drill.
+
+`docker inspect` results:
+
+- User: `app`
+- Env: `[DATABASE_URL=... PATH=... GPG_KEY=... PYTHON_VERSION=3.13.5 PYTHON_SHA256=... PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1]` - confirms the only injected app-specific value is `DATABASE_URL`, everything else is inherited from the base `python:3.13.5-slim` image (Python version/checksum, GPG key for verifying the Python install, pip config). No secrets beyond the one intentionally passed in for this test.
+- Ports: `map[8000/tcp:[{0.0.0.0 8001} {:: 8001}]]` - confirms the container's internal port 8000 is correctly mapped to host port 8001 (both IPv4 `0.0.0.0` and IPv6 `::` bindings), matching the `-p 8001:8000` flag.
+- Health status: `healthy` - confirms the image's built-in `HEALTHCHECK` instruction is actively running and passing inside this standalone container, independent of Compose.
+
+Frontend, run standalone:
+
+```text
+docker run -d --name module04-frontend-test -p 3001:3000 workboard-frontend:module04
+```
+
+`curl -i http://localhost:3001/api/health` → `HTTP/1.1 200 OK`, `{"status":"ready"}`
+
+Note: production output is compact JSON (`{"status":"ready"}`, 18 bytes) versus dev-mode's pretty-printed form (`{\n  "status": "ready"\n}`, seen earlier in the session) - Nitro's production build minifies JSON responses while dev mode pretty-prints them for readability. A real, verifiable production-vs-development behavior difference.
+
+Both containers stopped and removed after testing.
+
 ---
 
 ## Module entry template
