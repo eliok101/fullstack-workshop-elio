@@ -698,6 +698,28 @@ Reasoning per category (based on the actual files above, and which `.dockerignor
 
 Note: `scripts/check-secrets.sh`, referenced in this module's lab instructions and in `docs/security.md` as "a basic local guard," does not currently exist in this repository - confirmed by directory listing (`scripts/` only contains `setup.sh` and `validate-starter.py`). This step of the lab could not be executed as written; flagged as a gap between the module's assumptions and the actual starter state, rather than skipped silently.
 
+**Step 7 - Failure drills**
+
+Drill A - wrong CMD executable:
+
+Changed `backend/Dockerfile`'s production `CMD` to `["nonexistent-binary"]`, rebuilt as `workboard-backend:drill-a` (99.5s - unexpectedly a full cache miss on `pip install` even though only the `CMD` line changed; noted as a minor unexplained anomaly, not investigated further).
+
+`docker run --name drill-a-test workboard-backend:drill-a` → exact error: `exec: "nonexistent-binary": executable file not found in $PATH`, exit code 127 (the standard Unix "command not found" convention). `docker inspect` confirmed `Status=created`, `ExitCode=127`, with the full OCI runtime error chain captured (containerd shim → runc → exec).
+
+Cleaned up (container and drill image removed), `backend/Dockerfile` reverted, confirmed clean via `git status`/`git diff`.
+
+Drill B - missing required environment variable (`DATABASE_URL`):
+
+Ran the backend production container with no `DATABASE_URL` set at all. App started cleanly, no crash - logs show normal Uvicorn startup, and the image's own baked-in `HEALTHCHECK` (polling `/health/live`) passes internally.
+
+`curl -i /health/ready` → `HTTP/1.1 503 Service Unavailable`, `{"detail":"database unavailable"}`.
+
+Root cause, confirmed via `docker exec ... env | grep -i database` (returns nothing, confirming the variable is genuinely unset): `Settings.database_url` in `backend/app/core/config.py` has a hardcoded default value that gets used when `DATABASE_URL` is absent. This means the module's assumption ("remove a required runtime environment variable") doesn't hold for this specific variable - it isn't actually required at container startup at all. The app silently falls back to a default connection string whose hostname (`db`) only resolves inside the Docker Compose network, and the resulting failure only surfaces later, at request time, when `/health/ready` actually attempts to connect.
+
+Second finding within this drill: checked container logs for any trace of the underlying database connection exception (grep for traceback/exception/error) - found nothing. This contradicts a comment in `main.py` claiming "database details belong in logs, not the response." The exception details are correctly excluded from the HTTP response (good security practice, avoids leaking connection internals), but they are also completely absent from logs - a real operational gap. In production, an operator facing a 503 here would have no way to distinguish "wrong password" from "host unreachable" from "database fully down" without much deeper investigation, since nothing is actually logged server-side either.
+
+Cleaned up (container removed). No Dockerfile/code changes were needed for this drill since it only required omitting an env var at run time.
+
 ---
 
 ## Module entry template
