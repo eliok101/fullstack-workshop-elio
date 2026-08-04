@@ -522,6 +522,69 @@ Documented expected behavior instead (to verify empirically once Module 08 is co
 
 ---
 
+### Module 04 — Docker and container fundamentals
+
+**Date and branch**
+
+- Date: 2026-08-04
+- Branch: learning/04-docker-fundamentals
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Understand images, layers, containers, and build context; build and inspect multi-stage production images; confirm non-root runtime identity; diagnose build/runtime failures through deliberate drills.
+
+**Work completed so far**
+
+Step 1 - read all three Dockerfiles stage by stage:
+
+`backend/Dockerfile` (3 stages):
+
+- `base`: sets Python env vars (`PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED`), creates a non-root `app` user/group - shared foundation, nothing runs here.
+- `development`: copies full repo (owned by `app`), installs the package in editable mode (`pip install -e '.[dev]'`) which also pulls dev-only dependencies (test/lint tools) and reflects code changes immediately without reinstalling - matches `--reload`. Runs as `app`.
+- `production`: copies full repo, installs as a fixed, non-editable install (`pip install .`) for stable/predictable deploys, runs as `app`, adds a real `HEALTHCHECK` instruction and `--proxy-headers` (to trust Cloud Run's `X-Forwarded-*` headers), drops `--reload`.
+
+`frontend/Dockerfile` (4 stages):
+
+- `dependencies`: pins npm and installs from the committed lockfile (the fix from Module 00/02's Docker/npm bug).
+- `development`: builds on `dependencies`, copies full source, runs `npm run dev`.
+- `build`: also builds on `dependencies`, copies source, compiles via `npm run build`.
+- `production`: starts completely fresh from `node:22.16.0` rather than continuing from `dependencies` or `build`, and only copies the compiled `.output` directory from `build`. This keeps build tools, dev dependencies, and source code out of the final image entirely - smaller, more secure, and matches `security.md`'s explicit requirement that "build dependencies are not copied into final frontend image." Creates its own non-root user, runs `node server/index.mjs` directly with no npm involved.
+
+`e2e/Dockerfile`: does not exist yet. Confirmed this is expected - per `STARTER_SCOPE.md`/`COURSE_MAP.md`, the Playwright E2E service is built in Module 15, not present in the starter.
+
+Observation: an asymmetry exists between the two production images - backend's production stage has an explicit image-level `HEALTHCHECK` instruction, but frontend's does not; frontend's health checking currently only happens at the Compose level (`healthcheck:` in `compose.yaml`), not baked into the image itself. Flagging this as worth addressing, possibly as part of this module's evidence.
+
+**Step 2 - build production images directly and inspect**
+
+`docker build --target production -t workboard-backend:module04 backend` → succeeded on first attempt.
+
+`docker build --target production -t workboard-frontend:module04 frontend` → failed on first attempt with a genuine, previously undetected bug:
+
+```text
+RUN addgroup -r app && adduser -r app -g app
+Unknown option: r
+```
+
+Root cause: Debian's `adduser`/`addgroup` (the friendly wrapper scripts) never supported a `-r` flag - not on Debian, and not on the old Alpine/BusyBox image either (which used `-S` for "system", a different convention entirely). Whoever wrote the "delete the alpine" commit (Module 02) swapped Alpine's `-S`/`-G` for `-r`/`-g`, assuming it was the Debian equivalent - but picked the wrong tool's flag convention. The correct low-level equivalent, `--system`, is exactly what `backend/Dockerfile` already uses correctly via `useradd`/`groupadd`.
+
+Why this went undetected until now: `compose.yaml`'s `frontend` service only builds `target: development`, and BuildKit only builds stages required to reach the requested target - the `production` stage's `RUN addgroup` line had never actually executed in this entire project, not during any earlier `docker compose build frontend` run, not during the Module 02 merge-conflict verification. This is the first time `production` was built directly, and it broke immediately. Same underlying lesson as the Module 02 lockfile/glibc bug: passing one build path does not mean every path is correct.
+
+Fix applied: changed to `addgroup --system app && adduser --system --ingroup app app`, matching the working `backend/Dockerfile` pattern. Rebuild succeeded.
+
+Image size comparison:
+
+| Image | Disk usage | Content size |
+|---|---|---|
+| workboard-backend:module04 | 298MB | 69.9MB |
+| workboard-frontend:module04 | 1.61GB | 407MB |
+
+Second finding: frontend's production image is over 5x larger than backend's, but not because the multi-stage pattern failed - the actual `COPY --chown=app:app /workspace/.output ./` layer is only 3.66MB, confirming `security.md`'s "build dependencies are not copied into final frontend image" requirement genuinely holds (no `node_modules`, no build toolchain, no source in the final image). The bloat comes entirely from the base image itself: `node:22.16.0` (full Debian, not a `-slim` or `-alpine` variant) contributes over 1.1GB of apt/build-essential/yarn/gnupg layers before any application code is added, versus backend's `python:3.13.5-slim` base.
+
+Follow-up worth raising: switching the production stage's base to `node:22.16.0-slim` (still Debian/glibc, avoiding whatever motivated dropping Alpine in the first place, but far smaller) would likely recover most of this size difference without reintroducing the original Alpine/musl-related bug from Module 02. Not fixed as part of this module - flagged as a discovered opportunity, not implemented, since Module 04's lab step doesn't ask for base image optimization and this deserves its own reviewed change.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
