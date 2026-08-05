@@ -6,6 +6,7 @@ from app.api.router import router as api_router
 from app.api.routes import health
 from app.core.config import get_settings
 from app.core.exceptions import AppError
+from app.core.request_id import RequestIDMiddleware
 
 settings = get_settings()
 
@@ -18,6 +19,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestIDMiddleware)
 
 
 @app.exception_handler(AppError)

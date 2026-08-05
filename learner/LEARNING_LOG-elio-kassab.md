@@ -846,6 +846,30 @@ Ran the three required checks for real:
 
 All three quality gates now pass cleanly: `ruff check .`, `ruff format --check .`, and `mypy app`.
 
+**Independent challenge - request-ID middleware**
+
+Created `backend/app/core/request_id.py`: `RequestIDMiddleware`, a Starlette `BaseHTTPMiddleware` that reads an incoming `X-Request-ID` header if present, otherwise generates a fresh `uuid4`, stores it on `request.state.request_id` (making it available for future logging), and always returns it in the response's `X-Request-ID` header.
+
+Corrected a middleware-ordering mistake before testing: initially registered `RequestIDMiddleware` before `CORSMiddleware`, which (since Starlette applies middleware in reverse registration order - last added is outermost) would have made CORS the outer layer instead of request-ID tagging. Fixed by registering `CORSMiddleware` first and `RequestIDMiddleware` last, so request-ID tagging now wraps everything, including CORS preflight requests.
+
+Verified live via curl:
+
+| Scenario | X-Request-ID response header |
+|---|---|
+| No ID provided | `ddd05d6d-6737-4db6-b810-e72e208bdf0e` (freshly generated UUID) |
+| `test-fixed-id-12345` provided | `test-fixed-id-12345` (preserved exactly, byte-for-byte) |
+
+Created `backend/tests/test_request_id.py` with three automated tests: ID generation when absent, ID preservation when provided, and explicit confirmation that sensitive header values (tested with a fake Authorization bearer token) never leak into response headers - directly satisfying the module's instruction to "test header preservation/generation without logging tokens or bodies."
+
+Full suite now: `11 passed, 1 warning` (the same pre-existing, unrelated `StarletteDeprecationWarning` noted in Step 7) in `3.92s`.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - typed settings with pydantic-settings and a model_validator for cross-field production guards, versioned routing under /api/v1 separate from unversioned health checks, a domain exception hierarchy (AppError base with status_code/code, subclasses for specific errors) mapped through one centralized exception handler, explicit response_model declarations, dependency injection via Depends() for testability, dependency override in tests to avoid real databases, and middleware (RequestIDMiddleware) including correct registration ordering.
+- I can explain it without the reference code: yes - dependency injection keeps routes focused on HTTP handling while FastAPI owns dependency resolution, which is exactly what makes app.dependency_overrides possible in tests (only for Depends()-declared dependencies, not direct function calls); the exception-handling chain lets a dependency/service raise a domain exception that a registered handler converts into a consistent structured HTTP response, keeping business logic independent from HTTP response formatting.
+- I can diagnose one failure in this area: yes, with moderate confidence - comfortable building typed settings with validation, production safety checks, versioned routing, domain exception hierarchies, centralized exception handlers, dependency-injected testable code, dependency override tests, and middleware including ordering. Would still verify project conventions and documentation for larger production architectures or advanced dependency graphs.
+- Confidence from 1-5: 4.5/5 - comfortable with the overall FastAPI architecture and able to reason through similar design decisions; want more experience building larger applications from scratch and handling more advanced production patterns.
+
 ---
 
 ## Module entry template
