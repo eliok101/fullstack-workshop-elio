@@ -720,6 +720,39 @@ Second finding within this drill: checked container logs for any trace of the un
 
 Cleaned up (container removed). No Dockerfile/code changes were needed for this drill since it only required omitting an env var at run time.
 
+**Step 8 - Signal and shutdown behavior**
+
+| | PID 1 | docker stop time | Verdict |
+|---|---|---|---|
+| Backend | uvicorn (`app.main:app`) directly, no wrapper | 1.328s | Graceful - logs show "Shutting down" -> "Waiting for application shutdown" -> "Application shutdown complete" |
+| Frontend | `node server/index.mjs` directly, no wrapper | 0.947s | Graceful - no shutdown timeout hit (Docker's default is 10s before SIGKILL) |
+
+Both images run the actual application process as PID 1 directly - no tini/dumb-init/docker-init/shell wrapper in between. This matters because a bare PID 1 must handle SIGTERM itself (no init process forwards signals or reaps zombies for it). Both frameworks handle this correctly by default: uvicorn's own signal handler triggers its ASGI shutdown sequence; Node's server closes its listener on SIGTERM. Both containers stopped in under 1.5s, nowhere near Docker's 10s default timeout before escalating to SIGKILL - confirming genuinely graceful shutdown, not a timeout-then-kill fallback.
+
+**Independent challenge - throwaway Dockerfile comparison**
+
+Built a minimal Flask app (`scratch/app.py`, `requirements.txt`) with two Dockerfiles:
+
+`bad.Dockerfile`: `COPY . .` then `RUN pip install`, no `USER` instruction (runs as root).
+`good.Dockerfile`: `COPY requirements.txt .` then `RUN pip install`, then `COPY . .`, then `adduser` + `USER appuser`.
+
+Three specific changes and measured effect:
+
+1. Copy order (dependency manifest first vs. copy-everything-first): after touching an unrelated file and rebuilding, bad's `pip install` layer reran fully (13.4s, full reinstall of 7 packages); good's manifest `COPY` and `pip install` both showed `CACHED` (0s spent on dependencies).
+
+2. Non-root user: added `adduser` + `USER appuser` after app files are in place. `docker run --entrypoint whoami` confirmed bad -> `root`, good -> `appuser`. `docker history` shows the additional `RUN adduser` (73.7kB) and `USER appuser` (0B) layers present only in good.
+
+3. Layer ordering relative to volatility: isolating the rarely-changing dependency layer from the frequently-changing source-code layer meant good's second rebuild took ~0.8s total (only the fast `COPY . .` and `adduser` steps reran) versus bad's ~13.4s full reinstall for the same trivial unrelated-file change - roughly a 15x cache-hit speedup.
+
+Cleanup: `scratch/` directory deleted entirely, both `scratch-bad` and `scratch-good` images removed, confirmed neither was ever referenced in `compose.yaml`, and `git status` confirmed clean afterward (no leftover untracked files).
+
+**Self-rating**
+
+- I can repeat this with notes: yes - understand multi-stage builds (dependencies/development/build/production stage separation), why development uses editable installs and production uses fixed installs, why production starts fresh from a base image instead of continuing from a build stage, layer caching (order dependency manifests before source), non-root verification (USER instruction, whoami/id), and how to structure failure drills and throwaway Dockerfile comparisons.
+- I can explain it without the reference code: yes - can explain multi-stage builds separate install/dev/build/production concerns so the final image only contains what's needed to run; layer caching reuses unchanged layers based on Dockerfile instruction order; non-root security follows least-privilege - a compromised app only gets the app user's permissions, which reduces but doesn't eliminate impact.
+- I can diagnose one failure in this area: yes, with moderate confidence - comfortable with build failures from Dockerfile changes, cache-related rebuild issues, missing dependencies/files, permission and ownership problems, wrong-user containers, health check failures, and dev/production image differences. Would still verify with logs, Docker commands, and project docs for networking, orchestration, or production infrastructure issues.
+- Confidence from 1-5: 4/5 - solid grasp of Dockerfile design and container fundamentals; want more hands-on practice diagnosing unfamiliar runtime failures and optimizing builds beyond what this module's drills covered.
+
 ---
 
 ## Module entry template
