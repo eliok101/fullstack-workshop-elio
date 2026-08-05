@@ -19,7 +19,7 @@ ENV NODE_ENV=production \
     NITRO_HOST=0.0.0.0 \
     NITRO_PORT=3000
 WORKDIR /app
-RUN addgroup -r app && adduser -r app -g app
+RUN addgroup --system app && adduser --system --ingroup app app
 COPY --from=build --chown=app:app /workspace/.output ./
 USER app
 EXPOSE 3000

@@ -522,6 +522,239 @@ Documented expected behavior instead (to verify empirically once Module 08 is co
 
 ---
 
+### Module 04 — Docker and container fundamentals
+
+**Date and branch**
+
+- Date: 2026-08-04
+- Branch: learning/04-docker-fundamentals
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Understand images, layers, containers, and build context; build and inspect multi-stage production images; confirm non-root runtime identity; diagnose build/runtime failures through deliberate drills.
+
+**Work completed so far**
+
+Step 1 - read all three Dockerfiles stage by stage:
+
+`backend/Dockerfile` (3 stages):
+
+- `base`: sets Python env vars (`PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED`), creates a non-root `app` user/group - shared foundation, nothing runs here.
+- `development`: copies full repo (owned by `app`), installs the package in editable mode (`pip install -e '.[dev]'`) which also pulls dev-only dependencies (test/lint tools) and reflects code changes immediately without reinstalling - matches `--reload`. Runs as `app`.
+- `production`: copies full repo, installs as a fixed, non-editable install (`pip install .`) for stable/predictable deploys, runs as `app`, adds a real `HEALTHCHECK` instruction and `--proxy-headers` (to trust Cloud Run's `X-Forwarded-*` headers), drops `--reload`.
+
+`frontend/Dockerfile` (4 stages):
+
+- `dependencies`: pins npm and installs from the committed lockfile (the fix from Module 00/02's Docker/npm bug).
+- `development`: builds on `dependencies`, copies full source, runs `npm run dev`.
+- `build`: also builds on `dependencies`, copies source, compiles via `npm run build`.
+- `production`: starts completely fresh from `node:22.16.0` rather than continuing from `dependencies` or `build`, and only copies the compiled `.output` directory from `build`. This keeps build tools, dev dependencies, and source code out of the final image entirely - smaller, more secure, and matches `security.md`'s explicit requirement that "build dependencies are not copied into final frontend image." Creates its own non-root user, runs `node server/index.mjs` directly with no npm involved.
+
+`e2e/Dockerfile`: does not exist yet. Confirmed this is expected - per `STARTER_SCOPE.md`/`COURSE_MAP.md`, the Playwright E2E service is built in Module 15, not present in the starter.
+
+Observation: an asymmetry exists between the two production images - backend's production stage has an explicit image-level `HEALTHCHECK` instruction, but frontend's does not; frontend's health checking currently only happens at the Compose level (`healthcheck:` in `compose.yaml`), not baked into the image itself. Flagging this as worth addressing, possibly as part of this module's evidence.
+
+**Step 2 - build production images directly and inspect**
+
+`docker build --target production -t workboard-backend:module04 backend` → succeeded on first attempt.
+
+`docker build --target production -t workboard-frontend:module04 frontend` → failed on first attempt with a genuine, previously undetected bug:
+
+```text
+RUN addgroup -r app && adduser -r app -g app
+Unknown option: r
+```
+
+Root cause: Debian's `adduser`/`addgroup` (the friendly wrapper scripts) never supported a `-r` flag - not on Debian, and not on the old Alpine/BusyBox image either (which used `-S` for "system", a different convention entirely). Whoever wrote the "delete the alpine" commit (Module 02) swapped Alpine's `-S`/`-G` for `-r`/`-g`, assuming it was the Debian equivalent - but picked the wrong tool's flag convention. The correct low-level equivalent, `--system`, is exactly what `backend/Dockerfile` already uses correctly via `useradd`/`groupadd`.
+
+Why this went undetected until now: `compose.yaml`'s `frontend` service only builds `target: development`, and BuildKit only builds stages required to reach the requested target - the `production` stage's `RUN addgroup` line had never actually executed in this entire project, not during any earlier `docker compose build frontend` run, not during the Module 02 merge-conflict verification. This is the first time `production` was built directly, and it broke immediately. Same underlying lesson as the Module 02 lockfile/glibc bug: passing one build path does not mean every path is correct.
+
+Fix applied: changed to `addgroup --system app && adduser --system --ingroup app app`, matching the working `backend/Dockerfile` pattern. Rebuild succeeded.
+
+Image size comparison:
+
+| Image | Disk usage | Content size |
+|---|---|---|
+| workboard-backend:module04 | 298MB | 69.9MB |
+| workboard-frontend:module04 | 1.61GB | 407MB |
+
+Second finding: frontend's production image is over 5x larger than backend's, but not because the multi-stage pattern failed - the actual `COPY --chown=app:app /workspace/.output ./` layer is only 3.66MB, confirming `security.md`'s "build dependencies are not copied into final frontend image" requirement genuinely holds (no `node_modules`, no build toolchain, no source in the final image). The bloat comes entirely from the base image itself: `node:22.16.0` (full Debian, not a `-slim` or `-alpine` variant) contributes over 1.1GB of apt/build-essential/yarn/gnupg layers before any application code is added, versus backend's `python:3.13.5-slim` base.
+
+Follow-up worth raising: switching the production stage's base to `node:22.16.0-slim` (still Debian/glibc, avoiding whatever motivated dropping Alpine in the first place, but far smaller) would likely recover most of this size difference without reintroducing the original Alpine/musl-related bug from Module 02. Not fixed as part of this module - flagged as a discovered opportunity, not implemented, since Module 04's lab step doesn't ask for base image optimization and this deserves its own reviewed change.
+
+**Step 3 - prove runtime identity**
+
+`docker run --rm --entrypoint whoami workboard-backend:module04` → `app`
+`docker run --rm --entrypoint id workboard-backend:module04` → `uid=999(app) gid=999(app) groups=999(app)`
+`docker run --rm --entrypoint whoami workboard-frontend:module04` → `app`
+`docker run --rm --entrypoint id workboard-frontend:module04` → `uid=100(app) gid=102(app) groups=102(app)`
+
+Both confirmed non-root, matching the security model's "production images run as non-root users" requirement.
+
+Note: UID/GID values differ between images (999/999 backend vs. 100/102 frontend) because `useradd`/`groupadd --system` (backend, shadow-utils) and `adduser`/`addgroup --system` (frontend, Debian's wrapper) allocate system IDs from different ranges. Not an issue today since the containers don't share volumes, but would matter for file-ownership consistency if a shared bind mount were ever introduced.
+
+Why non-root reduces impact but is not a complete sandbox:
+
+A compromised process running as the non-root `app` user could still: read/modify files the `app` user has permission to access (including runtime secrets like the database URL and signing key, since the process needs to read them to function), make outbound network requests to any service the container can reach, and consume CPU/memory/disk (denial of service).
+
+What non-root prevents: modifying root-owned system files, installing system packages, binding to privileged ports (<1024) without extra capabilities, and gaining control of the host simply by being inside the container.
+
+Conclusion: non-root is one layer of defense-in-depth, not complete isolation - it limits blast radius but doesn't eliminate risk, which is why the security model also relies on scoped secret access (Secret Manager granting only specific secrets to the runtime service account), rather than depending on container user permissions alone to protect sensitive values.
+
+**Step 4 - run an isolated liveness process and inspect**
+
+Backend, run standalone with a fake/unreachable database URL (no real DB dependency needed for liveness):
+
+```text
+docker run -d --name module04-backend-test -p 8001:8000 -e DATABASE_URL="postgresql+psycopg://placeholder:placeholder@nonexistent:5432/placeholder" workboard-backend:module04
+```
+
+`curl -i http://localhost:8001/health/live` → `HTTP/1.1 200 OK`, `{"status":"alive"}`
+
+Confirms liveness has no database dependency, exactly as designed and previously verified in Module 01's database failure drill.
+
+`docker inspect` results:
+
+- User: `app`
+- Env: `[DATABASE_URL=... PATH=... GPG_KEY=... PYTHON_VERSION=3.13.5 PYTHON_SHA256=... PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1]` - confirms the only injected app-specific value is `DATABASE_URL`, everything else is inherited from the base `python:3.13.5-slim` image (Python version/checksum, GPG key for verifying the Python install, pip config). No secrets beyond the one intentionally passed in for this test.
+- Ports: `map[8000/tcp:[{0.0.0.0 8001} {:: 8001}]]` - confirms the container's internal port 8000 is correctly mapped to host port 8001 (both IPv4 `0.0.0.0` and IPv6 `::` bindings), matching the `-p 8001:8000` flag.
+- Health status: `healthy` - confirms the image's built-in `HEALTHCHECK` instruction is actively running and passing inside this standalone container, independent of Compose.
+
+Frontend, run standalone:
+
+```text
+docker run -d --name module04-frontend-test -p 3001:3000 workboard-frontend:module04
+```
+
+`curl -i http://localhost:3001/api/health` → `HTTP/1.1 200 OK`, `{"status":"ready"}`
+
+Note: production output is compact JSON (`{"status":"ready"}`, 18 bytes) versus dev-mode's pretty-printed form (`{\n  "status": "ready"\n}`, seen earlier in the session) - Nitro's production build minifies JSON responses while dev mode pretty-prints them for readability. A real, verifiable production-vs-development behavior difference.
+
+Both containers stopped and removed after testing.
+
+**Step 5 - Build cache behavior**
+
+`docker build --target production -t workboard-backend:cache-test backend` (baseline, identical content to `workboard-backend:module04`) → fully cached, `real 0m5.708s`, every layer including `COPY` and `pip install` shows `CACHED`.
+
+Test 1 - trivial change to a late (non-manifest) file (`backend/app/main.py`, added a comment): rebuild → `COPY` layer cache miss (0.2s) → `pip install` layer cache miss, full reinstall, `RUN` step `DONE 76.7s`, total `real 1m30.442s`. Reverted the file, confirmed `git diff`/`git status` clean before the next test.
+
+Test 2 - trivial change to the dependency manifest only (`backend/pyproject.toml`, added a comment, `app/main.py` reverted first to isolate the variable): rebuild → `COPY` layer cache miss again → `pip install` layer cache miss again, full reinstall, `RUN` step `DONE 97.5s`, total `real 1m56.364s`. Reverted the file, confirmed `backend/` fully clean afterward (`git diff --stat` and `git status --short` both empty).
+
+Key finding: `backend/Dockerfile`'s production stage does `COPY --chown=app:app . .` (entire context in one instruction) immediately before `RUN pip install --no-cache-dir .` - there's no separate manifest-first copy step. This means ANY file change in the build context invalidates both the `COPY` layer and the `pip install` layer together, with no way to change application code alone without forcing a full dependency reinstall.
+
+Contrast with `frontend/Dockerfile`'s `dependencies` stage, which does `COPY package.json package-lock.json ./` before `RUN npm ci`, and only copies full source in later stages - so a frontend source-only change does NOT force `npm ci` to rerun, while a backend source-only change always does. This is a real, asymmetric cost between the two Dockerfiles: frontend benefits from dependency-layer caching on every source edit, backend does not.
+
+Follow-up worth raising (not implemented, flagged only): `backend/Dockerfile` could adopt the same pattern - `COPY pyproject.toml` (and any lock file) first, run `pip install`, then `COPY` the rest of the source - to get the same dependency-layer caching benefit frontend already has.
+
+**Step 6 - Build context and exclusions**
+
+Root `.dockerignore`:
+
+```text
+.git
+.env
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/node_modules
+**/.nuxt
+**/.output
+**/coverage
+```
+
+`backend/.dockerignore`:
+
+```text
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+.coverage
+htmlcov
+```
+
+`frontend/.dockerignore`:
+
+```text
+node_modules
+.nuxt
+.output
+coverage
+npm-debug.log*
+```
+
+Reasoning per category (based on the actual files above, and which `.dockerignore` actually governs each build - `compose.yaml` sets `context: ./backend` / `context: ./frontend`, so only the subdirectory-local `.dockerignore` files apply to those builds, not the root one):
+
+- `.git`: only listed in the root `.dockerignore`, not in either subdirectory one. Doesn't matter in practice - `.git` lives at the repo root, outside both `backend/` and `frontend/` build contexts, so it's excluded structurally rather than by an applicable rule.
+- `.env`: same situation - only the root file lists it, and `.env` lives at the repo root, outside both build contexts. Latent gap: if a per-service `backend/.env` or `frontend/.env` were ever introduced, neither subdirectory `.dockerignore` currently has a rule that would catch it.
+- Test artifacts: properly excluded via the files that actually matter - `backend/.dockerignore` lists `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.coverage`, `htmlcov`; `frontend/.dockerignore` lists `coverage`.
+- `node_modules`: correctly excluded via `frontend/.dockerignore`'s explicit entry - the file that actually governs the frontend build context.
+- Terraform state: not excluded by any rule in any of the three files (none contain `*.tfstate`, `*.tfvars`, or `.terraform`). Moot today since `infrastructure/gcp/terraform/` is never used as a Docker build context for anything in `compose.yaml` - excluded structurally (out of scope entirely), not by policy. Same latent-gap pattern as `.env`: nothing would actually stop it if root ever became a build context.
+
+Note: `scripts/check-secrets.sh`, referenced in this module's lab instructions and in `docs/security.md` as "a basic local guard," does not currently exist in this repository - confirmed by directory listing (`scripts/` only contains `setup.sh` and `validate-starter.py`). This step of the lab could not be executed as written; flagged as a gap between the module's assumptions and the actual starter state, rather than skipped silently.
+
+**Step 7 - Failure drills**
+
+Drill A - wrong CMD executable:
+
+Changed `backend/Dockerfile`'s production `CMD` to `["nonexistent-binary"]`, rebuilt as `workboard-backend:drill-a` (99.5s - unexpectedly a full cache miss on `pip install` even though only the `CMD` line changed; noted as a minor unexplained anomaly, not investigated further).
+
+`docker run --name drill-a-test workboard-backend:drill-a` → exact error: `exec: "nonexistent-binary": executable file not found in $PATH`, exit code 127 (the standard Unix "command not found" convention). `docker inspect` confirmed `Status=created`, `ExitCode=127`, with the full OCI runtime error chain captured (containerd shim → runc → exec).
+
+Cleaned up (container and drill image removed), `backend/Dockerfile` reverted, confirmed clean via `git status`/`git diff`.
+
+Drill B - missing required environment variable (`DATABASE_URL`):
+
+Ran the backend production container with no `DATABASE_URL` set at all. App started cleanly, no crash - logs show normal Uvicorn startup, and the image's own baked-in `HEALTHCHECK` (polling `/health/live`) passes internally.
+
+`curl -i /health/ready` → `HTTP/1.1 503 Service Unavailable`, `{"detail":"database unavailable"}`.
+
+Root cause, confirmed via `docker exec ... env | grep -i database` (returns nothing, confirming the variable is genuinely unset): `Settings.database_url` in `backend/app/core/config.py` has a hardcoded default value that gets used when `DATABASE_URL` is absent. This means the module's assumption ("remove a required runtime environment variable") doesn't hold for this specific variable - it isn't actually required at container startup at all. The app silently falls back to a default connection string whose hostname (`db`) only resolves inside the Docker Compose network, and the resulting failure only surfaces later, at request time, when `/health/ready` actually attempts to connect.
+
+Second finding within this drill: checked container logs for any trace of the underlying database connection exception (grep for traceback/exception/error) - found nothing. This contradicts a comment in `main.py` claiming "database details belong in logs, not the response." The exception details are correctly excluded from the HTTP response (good security practice, avoids leaking connection internals), but they are also completely absent from logs - a real operational gap. In production, an operator facing a 503 here would have no way to distinguish "wrong password" from "host unreachable" from "database fully down" without much deeper investigation, since nothing is actually logged server-side either.
+
+Cleaned up (container removed). No Dockerfile/code changes were needed for this drill since it only required omitting an env var at run time.
+
+**Step 8 - Signal and shutdown behavior**
+
+| | PID 1 | docker stop time | Verdict |
+|---|---|---|---|
+| Backend | uvicorn (`app.main:app`) directly, no wrapper | 1.328s | Graceful - logs show "Shutting down" -> "Waiting for application shutdown" -> "Application shutdown complete" |
+| Frontend | `node server/index.mjs` directly, no wrapper | 0.947s | Graceful - no shutdown timeout hit (Docker's default is 10s before SIGKILL) |
+
+Both images run the actual application process as PID 1 directly - no tini/dumb-init/docker-init/shell wrapper in between. This matters because a bare PID 1 must handle SIGTERM itself (no init process forwards signals or reaps zombies for it). Both frameworks handle this correctly by default: uvicorn's own signal handler triggers its ASGI shutdown sequence; Node's server closes its listener on SIGTERM. Both containers stopped in under 1.5s, nowhere near Docker's 10s default timeout before escalating to SIGKILL - confirming genuinely graceful shutdown, not a timeout-then-kill fallback.
+
+**Independent challenge - throwaway Dockerfile comparison**
+
+Built a minimal Flask app (`scratch/app.py`, `requirements.txt`) with two Dockerfiles:
+
+`bad.Dockerfile`: `COPY . .` then `RUN pip install`, no `USER` instruction (runs as root).
+`good.Dockerfile`: `COPY requirements.txt .` then `RUN pip install`, then `COPY . .`, then `adduser` + `USER appuser`.
+
+Three specific changes and measured effect:
+
+1. Copy order (dependency manifest first vs. copy-everything-first): after touching an unrelated file and rebuilding, bad's `pip install` layer reran fully (13.4s, full reinstall of 7 packages); good's manifest `COPY` and `pip install` both showed `CACHED` (0s spent on dependencies).
+
+2. Non-root user: added `adduser` + `USER appuser` after app files are in place. `docker run --entrypoint whoami` confirmed bad -> `root`, good -> `appuser`. `docker history` shows the additional `RUN adduser` (73.7kB) and `USER appuser` (0B) layers present only in good.
+
+3. Layer ordering relative to volatility: isolating the rarely-changing dependency layer from the frequently-changing source-code layer meant good's second rebuild took ~0.8s total (only the fast `COPY . .` and `adduser` steps reran) versus bad's ~13.4s full reinstall for the same trivial unrelated-file change - roughly a 15x cache-hit speedup.
+
+Cleanup: `scratch/` directory deleted entirely, both `scratch-bad` and `scratch-good` images removed, confirmed neither was ever referenced in `compose.yaml`, and `git status` confirmed clean afterward (no leftover untracked files).
+
+**Self-rating**
+
+- I can repeat this with notes: yes - understand multi-stage builds (dependencies/development/build/production stage separation), why development uses editable installs and production uses fixed installs, why production starts fresh from a base image instead of continuing from a build stage, layer caching (order dependency manifests before source), non-root verification (USER instruction, whoami/id), and how to structure failure drills and throwaway Dockerfile comparisons.
+- I can explain it without the reference code: yes - can explain multi-stage builds separate install/dev/build/production concerns so the final image only contains what's needed to run; layer caching reuses unchanged layers based on Dockerfile instruction order; non-root security follows least-privilege - a compromised app only gets the app user's permissions, which reduces but doesn't eliminate impact.
+- I can diagnose one failure in this area: yes, with moderate confidence - comfortable with build failures from Dockerfile changes, cache-related rebuild issues, missing dependencies/files, permission and ownership problems, wrong-user containers, health check failures, and dev/production image differences. Would still verify with logs, Docker commands, and project docs for networking, orchestration, or production infrastructure issues.
+- Confidence from 1-5: 4/5 - solid grasp of Dockerfile design and container fundamentals; want more hands-on practice diagnosing unfamiliar runtime failures and optimizing builds beyond what this module's drills covered.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
