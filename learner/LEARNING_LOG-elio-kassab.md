@@ -917,6 +917,21 @@ Verification, in two stages:
 
 This is a concrete example of the difference between evidence that looks convincing and evidence that's actually conclusive - the first test could theoretically have passed even with a subtly broken commit/rollback implementation, as long as the generator's yield/exception timing happened to match; only direct assertion on the actual method calls closes that gap.
 
+**Step 3 - SQLAlchemy models**
+
+Created `backend/app/db/models.py` with a `Base` declarative class and five entities matching `database-design.md`'s baseline: `User`, `Project`, `ProjectMember`, `Task`, and `Comment`, plus `TaskStatus` and `TaskPriority` enums.
+
+Timestamp design decision: `created_at`/`updated_at` use `server_default=func.now()` (database-generated) rather than a Python-side default like `datetime.utcnow`. Reasoning: the database is the single authoritative time source, immune to clock skew across multiple application server instances (relevant given the architecture's Cloud Run autoscaling), and works correctly even for rows inserted outside the ORM (raw SQL, migrations, other tools).
+
+Relationship design decisions, made deliberately rather than by default:
+- `User` <-> `Project` (owner): bidirectional relationship with `back_populates` on both sides (`User.owned_projects`, `Project.owner`) - needed because SQLAlchemy requires `back_populates` on both attributes to recognize them as the same relationship and keep them synchronized in memory; without it, calling `project.owner = user` would not automatically update `user.owned_projects`, risking an inconsistent in-memory object graph until reloaded from the database.
+- `Project` -> `Task`: `cascade="all, delete-orphan"` - a task has no meaning without its parent project (matches the ER diagram's "contains" relationship), so deleting a project should delete its tasks. Deliberately NOT applying this pattern to `User` -> `Project`, since a project is a durable business entity that should survive its owner's deletion (ownership can be reassigned; other users may depend on the project's continued existence).
+- `ProjectMember.project` / `ProjectMember.user`: unidirectional relationships only (no `back_populates`, no reverse collections on `User`/`Project`) - a deliberate scope decision for this module, not an oversight. Flagged as a known gap: `User`/`Project` currently have no direct `.memberships` collection, which will need either a proper `back_populates` relationship or explicit queries through `ProjectMember` once membership-listing features are built (likely Module 07).
+- `Task.assignee_id` and `Comment` (`task_id`, `author_id`): bare foreign key columns with no `relationship()` objects. Deliberate YAGNI decision - no current feature needs to navigate from `Task` to its assignee's full `User` object or from `Comment` to its `Task`/author as Python objects; adding `relationship()` now would be unused complexity. Will add if/when a real feature (e.g. returning assignee details in an API response) needs it.
+- `Comment` has no `updated_at`, only `created_at` - treating comments as append-only/immutable for now, consistent with there being no comment-editing feature in the current design scope. Trivial to add later via a new migration if that changes.
+
+All three quality gates pass cleanly against the new models: `ruff check .`, `ruff format --check .`, and `mypy app` (15 source files, no issues). Also caught and fixed a pre-existing, previously unformatted file from Module 05 (`app/core/request_id.py`) during this same formatting pass.
+
 ---
 
 ## Module entry template
