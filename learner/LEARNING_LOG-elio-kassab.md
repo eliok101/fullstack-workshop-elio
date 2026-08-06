@@ -974,6 +974,24 @@ Ran the complete lifecycle against the real PostgreSQL database:
 
 This satisfies three validation checklist items directly: an empty PostgreSQL database reaches head using migrations only, the latest revision can be downgraded and reapplied safely in training, and `alembic check` reports no model drift.
 
+**Step 6 - one incremental migration**
+
+Added a composite index to `backend/app/db/models.py`'s `Task` class: `__table_args__ = (Index("ix_tasks_project_id_status", "project_id", "status"),)` - chosen deliberately over relying solely on the existing single-column `project_id` index, since a query filtering on both `project_id` and `status` together (e.g. "backlog tasks in project X") benefits from an index ordered by both columns: PostgreSQL can jump directly to matching entries rather than finding all rows for a project first and then filtering status afterward on each one. With a large project (e.g. 10,000 tasks, 500 backlog), this meaningfully reduces the amount of data scanned versus using the single-column index alone.
+
+Generated the migration as a genuinely new revision (not editing the applied initial migration, per the module's explicit warning): `docker compose run --rm backend alembic revision --autogenerate -m "add project_id status index on tasks"` -> correctly chained to the initial migration via `down_revision`, and correctly detected only the new index with no unrelated changes. Reviewed `upgrade()`/`downgrade()` - both clean mirror images, no equivalent gap to the earlier enum-cleanup issue since index creation/removal is inherently symmetric.
+
+Full lifecycle verified against the real database, including direct `psql` inspection at each step (not just trusting Alembic's own success messages):
+
+| Step | Result |
+|---|---|
+| `alembic upgrade head` | `27edc82c2b1b -> 4840454901bd` |
+| `alembic check` | `No new upgrade operations detected` |
+| `psql \d tasks` | `ix_tasks_project_id_status` present alongside the pre-existing `ix_tasks_project_id` |
+| `alembic downgrade -1` | `4840454901bd -> 27edc82c2b1b` |
+| `psql \d tasks` | Composite index gone, single-column index still present - confirms downgrade removed exactly and only what it added |
+| `alembic upgrade head` (reapply) | Clean, `27edc82c2b1b -> 4840454901bd` again |
+| `alembic check` | `No new upgrade operations detected` - final state matches models exactly |
+
 ---
 
 ## Module entry template
