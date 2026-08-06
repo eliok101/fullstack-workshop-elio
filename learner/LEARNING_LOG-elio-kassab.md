@@ -932,6 +932,48 @@ Relationship design decisions, made deliberately rather than by default:
 
 All three quality gates pass cleanly against the new models: `ruff check .`, `ruff format --check .`, and `mypy app` (15 source files, no issues). Also caught and fixed a pre-existing, previously unformatted file from Module 05 (`app/core/request_id.py`) during this same formatting pass.
 
+**Step 4 - Alembic initialization**
+
+Added `alembic==1.14.1` as a real runtime dependency (not a dev extra) in `backend/pyproject.toml`, since migrations need to run in production too (matching `docs/architecture.md`'s dedicated `workboard-migrate` Cloud Run job). Rebuilt the backend image to install it.
+
+Ran `alembic init migrations`, generating `backend/alembic.ini` and `backend/migrations/` (`env.py`, `script.py.mako`, `versions/`).
+
+Configured `backend/migrations/env.py` with two required changes:
+1. `target_metadata = Base.metadata` (imported from `app.db.models`) instead of `None` - this is what lets `alembic revision --autogenerate` compare the actual database against the five models built in Step 3.
+2. Both `run_migrations_offline()` and `run_migrations_online()` now call `config.set_main_option("sqlalchemy.url", get_settings().database_url)` before the URL is used, overriding whatever is in `alembic.ini` with the real, typed settings value - consistent with how `app/db/session.py` already resolves the database URL, and satisfying the module's explicit requirement that "the database URL should come from settings/environment rather than a committed credential."
+
+Confirmed `backend/alembic.ini`'s stock `sqlalchemy.url` placeholder (`driver://user:pass@localhost/dbname`) is Alembic's generic template text, never a real credential, and is now fully overridden at runtime regardless - left in place as an intentional, obviously-fake placeholder rather than removed, since its presence makes clear no real value lives there.
+
+**Autogenerate review — a real gap caught before it broke Step 5**
+
+Generated the initial migration: `docker compose run --rm backend alembic revision --autogenerate -m "initial workboard schema"`. Autogenerate correctly detected all five tables in FK-dependency-safe creation order (`users` -> `projects` -> `project_members` -> `tasks` -> `comments`), with correct indexes, nullability, and the composite primary key on `project_members`.
+
+Caught a real, well-documented Alembic/PostgreSQL gap before running the lifecycle: SQLAlchemy's `Enum` type creates a native PostgreSQL `ENUM` type (`taskstatus`, `taskpriority`) as a side effect of table creation in `upgrade()`, but Alembic's autogenerate does not emit a matching type-drop in `downgrade()` - it only drops tables and indexes. Left as generated, this would have caused `alembic downgrade base` to leave both enum types behind, and the immediately following `alembic upgrade head` (required by Step 5's lifecycle exercise) would have failed with `type "taskstatus" already exists`.
+
+Fix: added explicit cleanup at the end of `downgrade()`, after all table drops:
+```python
+sa.Enum(name="taskstatus").drop(op.get_bind(), checkfirst=True)
+sa.Enum(name="taskpriority").drop(op.get_bind(), checkfirst=True)
+```
+
+This directly demonstrates the module's own warning that "autogeneration proposes a migration; it does not understand business intent" and that a human must review "types... and downgrade safety" before trusting generated output - `upgrade()` needed no changes (table creation with its enum side effect worked correctly on the first pass), but `downgrade()` required a manual addition autogenerate simply doesn't know to produce.
+
+**Step 5 - full migration lifecycle**
+
+Ran the complete lifecycle against the real PostgreSQL database:
+
+| Command | Result |
+|---|---|
+| `alembic upgrade head` | `Running upgrade -> 27edc82c2b1b, initial workboard schema` |
+| `alembic current` | `27edc82c2b1b (head)` |
+| `alembic history --verbose` | Single revision, parent `<base>`, full metadata shown |
+| `alembic downgrade base` | `Running downgrade 27edc82c2b1b -> <base>` - succeeded, including the enum type cleanup |
+| `alembic upgrade head` (second time) | Succeeded cleanly - this is the exact step that would have failed with `type "taskstatus" already exists` without the earlier `downgrade()` fix, so this is direct empirical proof the fix was necessary, not just theoretically correct |
+| `alembic check` | `No new upgrade operations detected` - no drift between models and database |
+| `psql \dt` | All 6 tables present: `alembic_version`, `comments`, `project_members`, `projects`, `tasks`, `users` |
+
+This satisfies three validation checklist items directly: an empty PostgreSQL database reaches head using migrations only, the latest revision can be downgraded and reapplied safely in training, and `alembic check` reports no model drift.
+
 ---
 
 ## Module entry template
