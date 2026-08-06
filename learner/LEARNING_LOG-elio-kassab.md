@@ -903,6 +903,20 @@ Users and Projects have a many-to-many relationship: a user can belong to many p
 
 Why `project_members` uses a composite primary key (`project_id`, `user_id`) instead of its own auto-incrementing `id`: the composite key IS the row's identity - the combination itself is what must be unique, expressing "this user is a member of this project" directly. An auto-incrementing `id` alone would not prevent duplicate membership rows (the same `project_id`/`user_id` pair inserted twice) unless a separate unique constraint were added on top of it anyway - so the composite primary key is both more natural (no redundant surrogate key for a pure relationship table) and self-enforcing, rather than needing an extra constraint bolted on afterward.
 
+**Step 2 - engine and session configuration**
+
+Extended `backend/app/db/session.py` with `SessionLocal` (a `sessionmaker` bound to the existing engine, `autoflush=False`, `expire_on_commit=False`) and `get_db()`, a generator-based session dependency compatible with FastAPI's `Depends()`: yields a session, commits on clean completion, rolls back and re-raises on any exception, always closes in a `finally` block. This is the "one session per request" pattern - the alternative (one global session shared across requests) would cause transaction interference between concurrent users, rollback contamination (one user's error undoing another user's uncommitted work), stale cached objects, and race conditions, since SQLAlchemy sessions are not thread-safe and represent a single unit of work.
+
+`autoflush=False` chosen deliberately: the SQLAlchemy default (`autoflush=True`) would automatically write pending changes to the database before any query runs within the same session, which could push unvalidated data to the database mid-request (e.g. before business-rule validation completes). Disabling it means nothing is written until an explicit `flush()` or `commit()`, giving predictable control over when writes actually happen.
+
+Verification, in two stages:
+1. First pass tested the generator's control-flow contract (clean completion on success, exception re-propagation on failure) - this passed but only inferred that commit/rollback ran, without directly proving it.
+2. Recognized this gap and re-verified with a mock-patched version, asserting directly on `SessionLocal`'s mocked `commit`/`rollback`/`close` calls:
+   - Success path: `commit()` called, `rollback()` NOT called, `close()` called.
+   - Failure path: `commit()` NOT called, `rollback()` called, `close()` called.
+
+This is a concrete example of the difference between evidence that looks convincing and evidence that's actually conclusive - the first test could theoretically have passed even with a subtly broken commit/rollback implementation, as long as the generator's yield/exception timing happened to match; only direct assertion on the actual method calls closes that gap.
+
 ---
 
 ## Module entry template
