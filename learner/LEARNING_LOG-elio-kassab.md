@@ -755,6 +755,123 @@ Cleanup: `scratch/` directory deleted entirely, both `scratch-bad` and `scratch-
 
 ---
 
+### Module 05 — FastAPI foundation
+
+**Date and branch**
+
+- Date: 2026-08-05
+- Branch: learning/05-fastapi-foundation
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Build a real FastAPI application structure with versioned routers, typed settings with production security guards, dependency-injected database access, domain exception mapping, and tested health/status endpoints.
+
+**Work completed so far**
+
+Step 1 - package structure: created `backend/app/api/` (with `router.py` and `routes/` containing `health.py` and `status.py` placeholders) and `backend/app/core/exceptions.py`, matching the module's required structure.
+
+Step 2 - typed settings with a production security guard: expanded `backend/app/core/config.py` from a bare `app_name`/`database_url` pair to include `environment` (`Literal["development", "test", "production"]`), `api_prefix`, `cors_origins`, `secret_key`, access/refresh token durations, and cookie name.
+
+Key addition: a `model_validator(mode="after")` that refuses to construct `Settings` if `environment` is `"production"` and `secret_key` still equals the known demo value - this can only be implemented as a model validator, not a field validator, since it needs to compare two different fields' values together, which a single-field validator has no access to.
+
+Verified directly (not just assumed correct) via `docker compose run --rm backend python -c`: constructing `Settings(environment="production", secret_key=DEMO_SECRET_KEY)` raises the exact expected `ValueError` with a clear message; constructing `Settings(environment="development")` with the demo key succeeds normally. Note: dependencies only exist inside the Docker image (matches Module 04's understanding), so verification had to run through `docker compose run` rather than a bare host `python -c`, which failed with `ModuleNotFoundError` as expected.
+
+**Step 3 & 4 - versioned router, CORS, and health/status contracts**
+
+Created `backend/app/api/routes/health.py`, extracting shared readiness-check logic into a plain helper function (`_check_readiness()`) called by both `/health/ready` and `/health`, rather than one route calling another route directly - keeps HTTP handling separate from the underlying logic, matching the router/service separation described in Module 00's architecture doc.
+
+Created `backend/app/api/routes/status.py` with `GET /status` returning only `service`, `version`, and `environment` from settings - explicitly excluding `database_url`, `secret_key`, or any other sensitive/internal configuration value, per `api-contract.md`'s "do not add secret/config values" requirement.
+
+Wired everything together:
+- `backend/app/api/router.py` aggregates sub-routers (`status.router` included)
+- `backend/app/main.py` includes `health.router` directly at root (unversioned) and `api_router` under `settings.api_prefix` (`/api/v1`) - keeping infrastructure-level health/liveness checks stable and unversioned, separate from the versioned application API
+- Added `CORSMiddleware` reading allowed origins from `settings.cors_origins`
+
+Verified end-to-end with a real `docker compose up --build`:
+
+| Endpoint | Status | Body |
+|---|---|---|
+| GET /health/live | 200 | `{"status":"alive"}` |
+| GET /health/ready | 200 | `{"status":"ready"}` |
+| GET /health | 200 | `{"status":"ready"}` |
+| GET /api/v1/status | 200 | `{"service":"Workboard API","version":"0.1.0","environment":"development"}` |
+
+Confirms the versioned prefix works correctly (`/api/v1/status`, not `/status`), health endpoints remain unversioned and reachable at root, and the status response contains only the three approved fields.
+
+**OpenAPI verification (evidence screenshot)**
+
+Confirmed via http://localhost:8000/docs: the "health" tag correctly groups all three unversioned root-level routes (`/health/live`, `/health/ready`, `/health`), and the "status" tag shows `/api/v1/status` with the versioned prefix visible directly in the path. Page title and version ("Workboard API", "0.1.0") are pulled dynamically from settings rather than hardcoded, confirming `FastAPI(title=..., version=...)` picks up the typed settings correctly.
+
+**Step 5 - domain exception hierarchy**
+
+Created `backend/app/core/exceptions.py` with a small hierarchy: `AppError` (base, carries `status_code` and `code` as class attributes plus an instance `message`), and `NotFoundError` (404/`not_found`), `UnauthorizedError` (401/`unauthorized`), `ForbiddenError` (403/`forbidden`), `ConflictError` (409/`conflict`), `InvalidTransitionError` (409/`invalid_transition`, deliberately subclassing `ConflictError` rather than `AppError` directly, since an invalid transition IS a conflict with a more specific code - this means code catching `ConflictError` generically also catches `InvalidTransitionError`).
+
+Registered a single exception handler in `backend/app/main.py` (`@app.exception_handler(AppError)`) that converts any raised `AppError` into the `api-contract.md`-specified `{"detail": ..., "code": ...}` JSON shape with the correct status code - avoiding repetitive try/except blocks in every route.
+
+**Step 6 - schema-backed example route**
+
+Created `backend/app/api/routes/example.py` (marked as a temporary Module 05 exercise) with `POST /api/v1/echo`: a Pydantic `EchoRequest` (`name` field with min/max length constraints) and `EchoResponse`, declared explicitly via `response_model` and `status_code` rather than returning a bare dict.
+
+Verified all three distinct behaviors live, via a real `docker compose` rebuild and curl, not just code review:
+
+| Scenario | Status | Body |
+|---|---|---|
+| Valid request (`{"name": "Elio"}`) | 200 | `{"message":"Hello, Elio!"}` |
+| Malformed request (`{}`) | 422 | `{"detail":[{"type":"missing","loc":["body","name"],"msg":"Field required","input":{}}]}` - FastAPI's automatic Pydantic validation error |
+| Domain exception trigger (`{"name": "missing"}`) | 404 | `{"detail":"Resource named 'missing' does not exist","code":"not_found"}` - the custom `AppError` -> `handle_app_error` chain firing correctly |
+
+This confirms two genuinely distinct error paths exist and behave differently as designed: FastAPI's built-in schema validation (422, no `code` field) versus the domain-exception hierarchy (custom status codes, always includes a stable `code` field) - directly implementing the error matrix designed in Module 03.
+
+**Step 7 - foundation tests with dependency override**
+
+Extended `backend/tests/test_health.py` (keeping the existing `test_live_health_does_not_require_database` intact) with three new tests using `app.dependency_overrides[get_database_ready]` to simulate database success/failure without touching a real database:
+- `test_ready_health_success_with_override`
+- `test_ready_health_failure_with_override`
+- `test_health_combined_endpoint_uses_same_dependency`
+
+This required first refactoring `backend/app/api/routes/health.py` so the readiness check goes through `Depends(get_database_ready)` instead of being called directly - dependency override only works on functions wired through FastAPI's `Depends()` mechanism, not on plain function calls. During this refactor, caught my own regression before it shipped: an early draft dropped the try/except that converts a raw database exception into a 503, which would have silently changed a controlled 503 into an unhandled 500. Fixed by keeping the exception handling inside `get_database_ready` itself, then verified via a real rebuild that all three original health endpoints still behaved identically post-refactor.
+
+Created `backend/tests/test_api.py` with four more tests: `test_status_response_shape` (confirms only `service`/`version`/`environment` keys are present, explicitly asserting `database_url` and `secret_key` are NOT in the response body), `test_echo_valid_request`, `test_echo_invalid_schema_returns_422`, and `test_echo_domain_error_returns_mapped_404` (verifying the `AppError` -> `handle_app_error` chain).
+
+Ran the full suite for real: `docker compose run --rm backend pytest -v` -> `8 passed, 1 warning in 1.35s`. The one warning (`StarletteDeprecationWarning: httpx with starlette.testclient is deprecated`) is a genuine framework-level deprecation notice, not test noise - flagged as a future dependency-upgrade item, not fixed now since it's out of scope for this module.
+
+**Step 8 - quality gates**
+
+Ran the three required checks for real:
+
+`ruff check .` -> initially passed clean already.
+`ruff format --check .` -> initially failed on 4 files (`router.py`, `example.py`, `health.py`, `status.py`) - all missing a blank line between the module docstring and the first import. Fixed by running `ruff format .`, which only inserted the missing blank lines - no logic, ordering, or content changes.
+`python -m mypy app` -> initially failed with "No module named mypy" since mypy was never added to `backend/pyproject.toml`'s dev dependencies (only `httpx`, `pytest`, and `ruff` were listed). Added `mypy==1.14.1` to the dev extras, rebuilt the backend image so it actually installs, then ran it for real: `Success: no issues found in 13 source files`.
+
+All three quality gates now pass cleanly: `ruff check .`, `ruff format --check .`, and `mypy app`.
+
+**Independent challenge - request-ID middleware**
+
+Created `backend/app/core/request_id.py`: `RequestIDMiddleware`, a Starlette `BaseHTTPMiddleware` that reads an incoming `X-Request-ID` header if present, otherwise generates a fresh `uuid4`, stores it on `request.state.request_id` (making it available for future logging), and always returns it in the response's `X-Request-ID` header.
+
+Corrected a middleware-ordering mistake before testing: initially registered `RequestIDMiddleware` before `CORSMiddleware`, which (since Starlette applies middleware in reverse registration order - last added is outermost) would have made CORS the outer layer instead of request-ID tagging. Fixed by registering `CORSMiddleware` first and `RequestIDMiddleware` last, so request-ID tagging now wraps everything, including CORS preflight requests.
+
+Verified live via curl:
+
+| Scenario | X-Request-ID response header |
+|---|---|
+| No ID provided | `ddd05d6d-6737-4db6-b810-e72e208bdf0e` (freshly generated UUID) |
+| `test-fixed-id-12345` provided | `test-fixed-id-12345` (preserved exactly, byte-for-byte) |
+
+Created `backend/tests/test_request_id.py` with three automated tests: ID generation when absent, ID preservation when provided, and explicit confirmation that sensitive header values (tested with a fake Authorization bearer token) never leak into response headers - directly satisfying the module's instruction to "test header preservation/generation without logging tokens or bodies."
+
+Full suite now: `11 passed, 1 warning` (the same pre-existing, unrelated `StarletteDeprecationWarning` noted in Step 7) in `3.92s`.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - typed settings with pydantic-settings and a model_validator for cross-field production guards, versioned routing under /api/v1 separate from unversioned health checks, a domain exception hierarchy (AppError base with status_code/code, subclasses for specific errors) mapped through one centralized exception handler, explicit response_model declarations, dependency injection via Depends() for testability, dependency override in tests to avoid real databases, and middleware (RequestIDMiddleware) including correct registration ordering.
+- I can explain it without the reference code: yes - dependency injection keeps routes focused on HTTP handling while FastAPI owns dependency resolution, which is exactly what makes app.dependency_overrides possible in tests (only for Depends()-declared dependencies, not direct function calls); the exception-handling chain lets a dependency/service raise a domain exception that a registered handler converts into a consistent structured HTTP response, keeping business logic independent from HTTP response formatting.
+- I can diagnose one failure in this area: yes, with moderate confidence - comfortable building typed settings with validation, production safety checks, versioned routing, domain exception hierarchies, centralized exception handlers, dependency-injected testable code, dependency override tests, and middleware including ordering. Would still verify project conventions and documentation for larger production architectures or advanced dependency graphs.
+- Confidence from 1-5: 4.5/5 - comfortable with the overall FastAPI architecture and able to reason through similar design decisions; want more experience building larger applications from scratch and handling more advanced production patterns.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
