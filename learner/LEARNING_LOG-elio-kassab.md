@@ -872,6 +872,39 @@ Full suite now: `11 passed, 1 warning` (the same pre-existing, unrelated `Starle
 
 ---
 
+### Module 06 — PostgreSQL, SQLAlchemy, and Alembic
+
+**Date and branch**
+
+- Date: 2026-08-06
+- Branch: learning/06-data-and-migrations
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Model the real Workboard entities (users, projects, memberships, tasks, comments) with correct constraints and relationships, configure SQLAlchemy sessions safely, create and exercise a full Alembic migration lifecycle including downgrade, and prove transaction atomicity under a deliberate failure.
+
+**Work completed so far**
+
+Step 1 - design before coding, rule-placement classification:
+
+Practiced classifying business rules into the correct enforcement layer (Pydantic / service / database / frontend) before writing any code, per `database-design.md`'s guidance that a rule can exist in multiple layers for different purposes, but backend enforcement is authoritative.
+
+| Rule | Primary layer | Reasoning |
+|---|---|---|
+| Task cannot transition backlog -> done directly | Service | A business workflow rule - requires knowing both current and requested state, which Pydantic can't see and the database shouldn't encode as business logic. Frontend can hide the option for UX, but the backend must still enforce it since the API can be called directly. |
+| Email must be unique | Database (primary), Service (secondary) | Database UNIQUE constraint is the authoritative guarantee, immune to race conditions. A service-layer pre-check exists only to produce a friendlier error message before hitting the database, not as the real safety net. |
+| Project owner cannot be removed from project_members | Service | Depends on the member's role - a business rule requiring lookup and decision logic, not something a raw database constraint or Pydantic schema check can express. |
+| due_date must be a valid date, if provided | Pydantic | Pure shape/format validation (`date \| None`) - rejects malformed values (invalid calendar dates, wrong types) before the request ever reaches the service or database layer. |
+
+**Cardinality analysis: Users <-> Projects via project_members**
+
+Users and Projects have a many-to-many relationship: a user can belong to many projects, and a project can have many users. This can't be represented with a simple foreign key on either side, so it requires a junction/join table (`project_members`).
+
+Why `project_members` uses a composite primary key (`project_id`, `user_id`) instead of its own auto-incrementing `id`: the composite key IS the row's identity - the combination itself is what must be unique, expressing "this user is a member of this project" directly. An auto-incrementing `id` alone would not prevent duplicate membership rows (the same `project_id`/`user_id` pair inserted twice) unless a separate unique constraint were added on top of it anyway - so the composite primary key is both more natural (no redundant surrogate key for a pure relationship table) and self-enforcing, rather than needing an extra constraint bolted on afterward.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
