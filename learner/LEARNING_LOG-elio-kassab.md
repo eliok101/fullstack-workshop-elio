@@ -1113,6 +1113,18 @@ Changing `create_project_with_owner`'s signature broke Module 06's existing `tes
 
 Both tests re-verified against real PostgreSQL: `docker compose run --rm backend pytest tests/test_transactions.py -v` -> `2 passed in 2.53s`.
 
+**Step 4 - task transition rule as a pure function**
+
+Initial design consideration: whether backward transitions (`in_progress -> backlog`, `done -> in_progress`) should be supported, since the module explicitly leaves this as an open design decision to document. My first instinct was to allow some backward transitions (reopening a done task, moving `in_progress` back to `backlog`) for realistic product behavior. Revised after rereading `api-contract.md`, which explicitly states "moving backward is not supported in the baseline" - this isn't an open design choice for the baseline implementation, it's a documented contract requirement. Corrected the transition table to match the spec exactly rather than extending scope based on what seemed reasonable in isolation.
+
+Final policy, explicit and documented (not left implicit in the code):
+- Allowed: `backlog->backlog`, `backlog->in_progress`, `in_progress->in_progress`, `in_progress->done`, `done->done` (three same-state no-ops, two documented forward transitions)
+- Rejected: `backlog->done` (explicit invalid direct jump per `api-contract.md`), and all three backward transitions (`in_progress->backlog`, `done->backlog`, `done->in_progress`) - backward transitions are entirely out of scope for this baseline, per the contract's explicit statement.
+
+Created `backend/app/services/task_transitions.py`: a pure function, `is_transition_allowed(current, requested)`, with zero database or persistence dependencies - just a dict-of-sets lookup. This is deliberately built and tested before being wired into the task service (Step 5), per the module's explicit ordering requirement.
+
+Created `backend/tests/test_task_transitions.py` with an exhaustive, parametrized test covering all 9 possible `(current, requested)` combinations (the full 3x3 Cartesian product of `TaskStatus`). All 9 pass individually and visibly: `docker compose run --rm backend pytest tests/test_task_transitions.py -v` -> `9 passed in 0.96s`. No database involved - fast, isolated unit tests of pure business logic.
+
 ---
 
 ## Module entry template
