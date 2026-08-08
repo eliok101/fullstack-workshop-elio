@@ -1251,6 +1251,13 @@ Added 4 automated tests to `backend/tests/test_tasks_api.py`: `test_filter_by_pr
 
 Confirmed via `/openapi.json` (queried directly, not assumed) that `status` and `priority` appear as proper, optional, typed query parameters on the endpoint - each with `schema.$ref` pointing at the `TaskStatus`/`TaskPriority` enum definitions - satisfying the "docs" requirement automatically through FastAPI's OpenAPI generation, no manual documentation needed.
 
+**Self-rating**
+
+- I can repeat this with notes: yes - PATCH schemas with `exclude_unset=True` to distinguish omitted vs. explicit-null fields, focused repository methods (targeted existence checks rather than fetch-and-filter), service-layer business logic and transaction orchestration, resource-scoped authorization applied consistently to both visibility and ownership checks, the pure transition function pattern, thin route controllers, mutation testing to prove tests actually catch regressions, empirical N+1 verification, and incremental optional-filter query composition.
+- I can explain it without the reference code: yes - resource-scoped 404s mean authorization is part of resource lookup itself (check access -> 404 if denied -> then look up the resource), not a separate step after finding it, preventing information leakage about resources inside inaccessible parents; the transition rule is a pure function (same input always produces the same output, no database, no side effects) specifically to make it exhaustively unit-testable in isolation before it ever touches persistence; check ordering matters because reversing authorization and resource lookup risks confirming a resource's existence to someone who shouldn't even know to ask.
+- I can diagnose one failure in this area: mostly yes - confident building a similar CRUD domain end-to-end (repositories, services, routes, schemas, migrations, authorization, filtering) for an unfamiliar entity set, would likely need to reference exact framework syntax occasionally. Would be slower at designing larger authorization systems, advanced eager-loading strategies, and diagnosing subtle production performance issues.
+- Confidence from 1-5: 4/5 - understand the architecture and the reasoning behind each design decision (resource-scoped authorization, focused repositories, pure transition functions, check ordering, incremental filtering), not just the syntax to implement them. The remaining gap toward a 5 is experience applying these patterns independently across larger or unfamiliar systems, not conceptual understanding.
+
 ---
 
 ## Module entry template
