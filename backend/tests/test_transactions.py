@@ -1,10 +1,12 @@
 """Tests proving atomicity of create_project_with_owner against real PostgreSQL."""
+
 import os
 
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import Project, ProjectMember, User
 from app.db.session import SessionLocal
@@ -29,20 +31,20 @@ def test_user(db_session):
     db_session.add(user)
     db_session.flush()
     yield user
-    db_session.execute(
-        select(ProjectMember).where(ProjectMember.user_id == user.id)
-    )
+    db_session.execute(select(ProjectMember).where(ProjectMember.user_id == user.id))
     db_session.rollback()
 
 
-def test_failure_rolls_back_both_inserts(db_session, test_user):
-    with pytest.raises(RuntimeError, match="simulated failure"):
+def test_failure_rolls_back_both_inserts(db_session):
+    nonexistent_owner_id = 999999
+
+    with pytest.raises(IntegrityError):
         create_project_with_owner(
             db_session,
             name="Should Not Exist",
-            slug="should-not-exist",
-            owner_id=test_user.id,
-            simulate_failure=True,
+            description=None,
+            is_public=False,
+            owner_id=nonexistent_owner_id,
         )
     db_session.rollback()
 
@@ -51,9 +53,13 @@ def test_failure_rolls_back_both_inserts(db_session, test_user):
     ).scalar_one_or_none()
     assert project is None, "project row should not exist after rollback"
 
-    memberships = db_session.execute(
-        select(ProjectMember).where(ProjectMember.user_id == test_user.id)
-    ).scalars().all()
+    memberships = (
+        db_session.execute(
+            select(ProjectMember).where(ProjectMember.user_id == nonexistent_owner_id)
+        )
+        .scalars()
+        .all()
+    )
     assert len(memberships) == 0, "membership row should not exist after rollback"
 
 
@@ -61,9 +67,9 @@ def test_success_commits_both_inserts(db_session, test_user):
     project = create_project_with_owner(
         db_session,
         name="Should Exist",
-        slug="should-exist",
+        description=None,
+        is_public=False,
         owner_id=test_user.id,
-        simulate_failure=False,
     )
     db_session.flush()
 

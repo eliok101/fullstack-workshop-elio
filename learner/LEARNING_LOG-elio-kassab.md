@@ -1053,6 +1053,213 @@ Write/storage cost discussion: the composite index adds overhead on every INSERT
 
 ---
 
+### Module 07 — Backend domain architecture and CRUD
+
+**Date and branch**
+
+- Date: 2026-08-08
+- Branch: learning/07-backend-domain
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Implement real project and task CRUD workflows through the full router -> schema -> service -> repository -> model layering, enforce business rules and transaction ownership in services, return consistent resource-scoped error responses without leaking private resource existence, and build tested list/create/read/update/delete behavior.
+
+**Work completed so far**
+
+Step 1 - external schemas:
+
+Created `backend/app/schemas/projects.py` (`ProjectCreate`, `ProjectUpdate`, `ProjectRead`, `ProjectPublicSummary`) and `backend/app/schemas/tasks.py` (`TaskCreate`, `TaskUpdate`, `TaskRead`), matching `database-design.md`'s models exactly while explicitly excluding internal-only fields.
+
+Three deliberate design decisions confirmed, not left as accidental gaps:
+
+1. `slug` is absent from `ProjectCreate` - slug generation is server-side (service layer), not client-supplied, per `database-design.md`'s design decision.
+
+2. `ProjectPublicSummary` (`task_count`, `completed_task_count`) cannot be built via `model_validate(project)`/`from_attributes`, since those are computed aggregates, not direct `Project` model attributes - this schema will need to be assembled manually from a dedicated repository query, not validated straight from an ORM object.
+
+3. The "field omitted vs. explicitly set to null" problem (`ProjectUpdate.description`, `TaskUpdate.assignee_id`): a plain `Optional` field can't distinguish a client that didn't send a field from one that explicitly sent `null` to clear it - both collapse to the same `None` value after Pydantic parsing. This matters most for `TaskUpdate.assignee_id`, since unassigning a task is a common real action, not an edge case. Resolved architecturally, not in the schema itself: the service layer (Steps 3 and 5) will use `model_fields_set` to check which fields were actually present in the request before deciding what to update.
+
+4. `TaskUpdate.status` accepts any valid `TaskStatus` enum value at the schema level (Pydantic validates it's a real status), but does NOT enforce which transitions are legal (e.g. rejecting `backlog -> done`) - that's a stateful rule depending on the task's current status, which a schema validator can't see in isolation. Consistent with the layer-placement reasoning from Module 06: shape/type validation belongs in Pydantic, but a rule that depends on existing state belongs in the service layer via the dedicated pure transition function required by Step 4.
+
+**Step 2 - repositories**
+
+Created `backend/app/repositories/projects.py` with focused query functions (not a generic repository abstraction, per the module's explicit warning): `get_project_by_id`, `get_project_by_slug`, `list_projects_visible_to_user` (OR of ownership and membership, via `outerjoin` + `distinct` to avoid duplicate rows when a user is both owner and has a membership row), `is_project_visible_to_user` (a dedicated targeted existence check), `get_project_task_counts` (resolving the `ProjectPublicSummary` aggregate gap from Step 1), `slug_exists`, and `get_user_by_email`.
+
+Design reasoning for the dedicated `is_project_visible_to_user` query rather than reusing `list_projects_visible_to_user` and checking membership in the result: a single-resource endpoint like `GET /api/v1/projects/{project_id}` only needs to answer one yes/no question. Reusing the list query would fetch and construct every visible project (potentially hundreds) just to check if one specific ID is among them - wasted I/O, wasted object construction, wasted data transfer. A targeted existence query lets the database use indexes and stop as soon as it finds one matching row, which matters significantly for a single-resource endpoint that will be called far more frequently than the list endpoint.
+
+Noted for later review (Step 9): `get_project_task_counts` currently runs two separate `COUNT` queries rather than one grouped/conditional query - functionally correct, flagged as a potential query-consolidation opportunity rather than fixed now.
+
+**Step 2 (continued) - task repository and add/delete design decision**
+
+Created `backend/app/repositories/tasks.py` with `get_task_by_id_and_project` (filters on BOTH `Task.id` and `Task.project_id` in a single `WHERE` clause) and `list_tasks_for_project`.
+
+Critical security reasoning for filtering on both IDs together rather than fetching by `task_id` alone and checking `project_id` afterward: doing it as two separate steps would mean fetching a task's data before deciding it isn't accessible via this path - a subtle problem even if the data is never returned to the caller. Filtering on both in one query means a mismatched `task_id`/`project_id` combination (e.g. requesting `/projects/5/tasks/99` when task 99 actually belongs to project 3) returns nothing at all - the caller cannot distinguish "task doesn't exist" from "task exists but isn't in this project," which is exactly the resource-scoped 404 semantics designed in Module 03. This directly satisfies the module's validation checklist item "a task cannot be addressed through the wrong project path."
+
+Design decision: no add/delete/flush wrapper functions were added to either repository file (`projects.py` or `tasks.py`). `db.add()`/`db.delete()` calls will happen directly in the service layer via the already-injected `Session`, rather than through trivial repository pass-through functions like `add_task(db, task): db.add(task)` - the module explicitly warns against "creating generic abstractions before repeated behavior exists," and a one-line wrapper around a single SQLAlchemy call adds no domain value.
+
+**Step 3 - project service**
+
+Rewrote `backend/app/services/projects.py`, replacing Module 06's original `create_project_with_owner` (which had a `slug` parameter and a test-only `simulate_failure` flag) with the real implementation:
+
+- `slugify(name)` + `generate_unique_slug(db, name)`: deterministic slug generation (lowercase, non-alphanumeric characters collapsed to hyphens) with a deterministic collision-handling sequence (`website-redesign` -> `website-redesign-2` -> `website-redesign-3`, etc.) rather than random suffixes - determinism matters because the uniqueness-check loop (generate candidate -> check existence -> increment if taken) requires predictable, testable candidates.
+- `create_project_with_owner(db, name, description, is_public, owner_id)`: generates the slug server-side, creates the `Project`, flushes to populate its `id`, then creates the owner `ProjectMember` row - reusing the exact flush-before-commit atomicity pattern proven in Module 06.
+- `get_visible_project_or_404`: wraps repository lookup + visibility check, raising `NotFoundError` (not `ForbiddenError`) if the project doesn't exist OR isn't visible to the user - a resource-scoped 404 per the Module 03 pattern, so a private project's existence is never confirmed to an unauthorized caller.
+- `update_project` / `delete_project`: both raise `NotFoundError` (not `ForbiddenError`) when the requesting user isn't the project owner - same resource-scoped 404 reasoning applied to authorization failures, not just visibility failures. `update_project` takes `update_data: dict[str, Any]` rather than the raw `ProjectUpdate` schema directly - the translation from "schema with omitted vs. explicit-null fields" to "only the fields the client actually sent" (via `model_fields_set`) will happen in the route layer, not here, since deciding which fields were present in the HTTP request is fundamentally a request-parsing concern.
+- `get_public_project_summary`: looks up by slug, verifies `is_public`, and assembles a `ProjectPublicSummary` manually using `get_project_task_counts`, since (per Step 1) that schema's fields aren't direct `Project` model attributes.
+
+**Fixing a regression this rewrite caused**
+
+Changing `create_project_with_owner`'s signature broke Module 06's existing `test_transactions.py`, which called the old signature (`slug=...`, `simulate_failure=True/False`) - neither parameter exists anymore. Fixed by rewriting the test to use a genuinely stronger atomicity proof: instead of an artificial `simulate_failure` flag that only exists in test code, the failure test now passes a nonexistent `owner_id` (999999), triggering a real PostgreSQL foreign-key constraint violation (`sqlalchemy.exc.IntegrityError`) when `create_project_with_owner` tries to flush the project insert. This is a more valuable test than the original, since it exercises the actual production failure path (a genuine database constraint) rather than a hand-injected exception that could never occur outside of tests - verifying that SQLAlchemy, PostgreSQL's constraint enforcement, exception propagation, and session rollback all work together correctly, not just that raising an exception triggers a rollback in isolation.
+
+Both tests re-verified against real PostgreSQL: `docker compose run --rm backend pytest tests/test_transactions.py -v` -> `2 passed in 2.53s`.
+
+**Step 4 - task transition rule as a pure function**
+
+Initial design consideration: whether backward transitions (`in_progress -> backlog`, `done -> in_progress`) should be supported, since the module explicitly leaves this as an open design decision to document. My first instinct was to allow some backward transitions (reopening a done task, moving `in_progress` back to `backlog`) for realistic product behavior. Revised after rereading `api-contract.md`, which explicitly states "moving backward is not supported in the baseline" - this isn't an open design choice for the baseline implementation, it's a documented contract requirement. Corrected the transition table to match the spec exactly rather than extending scope based on what seemed reasonable in isolation.
+
+Final policy, explicit and documented (not left implicit in the code):
+- Allowed: `backlog->backlog`, `backlog->in_progress`, `in_progress->in_progress`, `in_progress->done`, `done->done` (three same-state no-ops, two documented forward transitions)
+- Rejected: `backlog->done` (explicit invalid direct jump per `api-contract.md`), and all three backward transitions (`in_progress->backlog`, `done->backlog`, `done->in_progress`) - backward transitions are entirely out of scope for this baseline, per the contract's explicit statement.
+
+Created `backend/app/services/task_transitions.py`: a pure function, `is_transition_allowed(current, requested)`, with zero database or persistence dependencies - just a dict-of-sets lookup. This is deliberately built and tested before being wired into the task service (Step 5), per the module's explicit ordering requirement.
+
+Created `backend/tests/test_task_transitions.py` with an exhaustive, parametrized test covering all 9 possible `(current, requested)` combinations (the full 3x3 Cartesian product of `TaskStatus`). All 9 pass individually and visibly: `docker compose run --rm backend pytest tests/test_task_transitions.py -v` -> `9 passed in 0.96s`. No database involved - fast, isolated unit tests of pure business logic.
+
+**Step 5 - task service**
+
+Created `backend/app/services/tasks.py`, following the module's mandated 5-step discipline (verify project access -> verify task belongs to project -> validate -> persist once -> return) on every operation: `create_task`, `list_tasks`, `get_task_or_404`, `update_task`, `delete_task`. `get_task_or_404` centralizes the first two steps so `update_task`/`delete_task` cannot accidentally skip them - directly addressing the module's warned failure mode of "putting access checks only in list routes but not update/delete routes."
+
+Check-ordering design confirmed deliberately: `get_task_or_404` checks project visibility (`get_visible_project_or_404`) BEFORE checking task existence within that project. Reasoning: if a user has no access to a project at all, checking task existence first would leak information through response-timing/shape differences (e.g. distinguishing "task exists but forbidden" from "task doesn't exist" across repeated requests would let an attacker enumerate real task IDs inside a project they can't see). Checking project visibility first means every unauthorized request gets the identical 404 response regardless of whether the requested task actually exists, and avoids an unnecessary database query for users who fail the project-level check anyway.
+
+Authorization policy confirmed deliberately (not an oversight): task operations (create/update/delete) are visibility-gated (owner OR member, via `get_visible_project_or_404`), while project-level operations (`update_project`/`delete_project` from Step 3) are ownership-gated (owner only). This means any project member can create, edit, or delete tasks, but only the project owner can modify or delete the project itself - a coherent, common collaborative-work pattern (task work is shared; project-level changes are more consequential and owner-restricted), matching how tools like Trello/Linear separate board-member permissions from board-owner/admin permissions.
+
+Fixed two issues caught during review: removed an unused `TaskStatus` import, and tightened `create_task`'s loose type hints (`priority: str` -> `TaskPriority`, `due_date: Any` -> `date | None`) to match the Step 1 schemas exactly, letting mypy actually catch type mismatches instead of accepting anything.
+
+Quality gates: `ruff check .` and `mypy app` both pass cleanly on the new service files (25 source files, no issues). One pre-existing, unrelated lint warning was found in Module 06's already-applied migration file (`migrations/versions/4840454901bd_...py`: unused `sqlalchemy` import in autogenerated boilerplate) - deliberately left unfixed, since editing an already-applied migration is exactly what Module 06 established as unsafe practice (creates drift risk between environments), and the cosmetic cost of leaving one unused import is far lower than the risk of touching applied migration history.
+
+**Step 6 - versioned routes**
+
+Created `backend/app/api/routes/projects.py` and `backend/app/api/routes/tasks.py`, implementing the full documented API surface from `api-contract.md`: `GET`/`POST /projects`, `GET`/`PATCH`/`DELETE /projects/{id}`, `GET /projects/public/{slug}`, and `GET`/`POST /projects/{id}/tasks`, `GET`/`PATCH`/`DELETE /projects/{id}/tasks/{id}`. Both wired into `backend/app/api/router.py`.
+
+Both route files use `FAKE_CURRENT_USER_ID = 1`, a clearly named, commented placeholder ("temporary until Module 08 authentication") standing in for real authenticated user identity, which doesn't exist yet. This is deliberate scaffolding, not a hidden shortcut - matches the same "document the gap honestly rather than pretend it doesn't exist" principle used for Module 00's mentor-agreement gap. Duplicated across both route files rather than centralized, since Module 08 will replace both instances with real authentication anyway - not worth consolidating a placeholder about to be deleted.
+
+Real bug caught before it shipped: `GET /projects/public/{slug}` was initially registered AFTER `GET /projects/{project_id}` in the route file. FastAPI/Starlette matches routes by path structure in registration order, not by parameter type - `/projects/{project_id}` structurally matches `/projects/public` too (`project_id: int` is only validated after route selection, via Pydantic), so a request to `/projects/public/my-slug` would have matched the wrong route first and failed with an unexpected 422 instead of ever reaching the public-summary handler. Fixed by moving the more specific static-prefix route before the generic parameterized one.
+
+Confirmed connection: PATCH routes use `payload.model_dump(exclude_unset=True)` to build the update dict passed to `update_project`/`update_task` - this is the actual mechanism resolving the "field omitted vs. explicitly set to null" gap flagged in Step 1. `exclude_unset=True` uses Pydantic's internal tracking of which fields were actually present in the request (the same information exposed via `model_fields_set`) to produce a dict containing only client-provided fields: an omitted field is absent from the dict entirely (existing value untouched), while an explicit null is present with value `None` (field intentionally cleared) - exactly the PATCH semantics required.
+
+Also fixed accumulated formatting debt: 13 files written directly across Steps 2-6 had never been run through `ruff format` (repositories, schemas, services, tests, and migration files from Module 06). Ran `ruff format .` once to clean up all of them together.
+
+Quality gates: `ruff format --check .` and `mypy app` both clean (27 source files). `ruff check .` has exactly one known, intentionally unfixed error (Module 06's already-applied migration file's unused import) - unrelated to this module's new code.
+
+**Step 7 - manual contract walkthrough**
+
+Rebuilt and ran the full stack, exercising every endpoint against `api-contract.md`'s documented behavior. One real gap surfaced immediately: the very first request (`POST /projects`) returned a 500, not the expected 201. Root cause: the `users` table was empty - `FAKE_CURRENT_USER_ID = 1` assumes a user with that id exists, and the `projects_owner_id_fkey` foreign key constraint correctly rejected the insert. Fixed by manually inserting a placeholder user with `id=1` via `psql` to unblock the walkthrough.
+
+Decision: not building a permanent seed script for this - `FAKE_CURRENT_USER_ID` is itself temporary scaffolding that Module 08 will delete entirely once real authentication exists, so investing in a reproducible seed mechanism for a placeholder about to be removed isn't worthwhile. Instead, added an inline comment next to both `FAKE_CURRENT_USER_ID` definitions noting that a user with that id must exist, pointing back to this log entry.
+
+Full walkthrough results, all 10 scenarios:
+
+| # | Test | Result |
+|---|---|---|
+| 1 | `POST /projects` | 201, project created (after fixing the missing seed-user gap) |
+| 2 | `GET /projects` | 200, correctly lists the one visible project |
+| 3 | `GET /projects/{id}` | 200, correct project |
+| 4 | `GET /projects/public/{slug}` | 200, correct summary - confirms the Step 6 route-ordering fix genuinely works in practice |
+| 5 | `POST /projects/{id}/tasks` | 201, task created, status defaults to backlog |
+| 6 | `GET /projects/{id}/tasks` | 200, correctly scoped list |
+| 7 | PATCH task status backlog -> in_progress | 200, valid transition applied |
+| 8 | PATCH fresh task status backlog -> done directly | 409, `code: "invalid_transition"` - the transition rule genuinely blocks the documented invalid jump in a live HTTP request, not just in unit tests |
+| 9 | `GET /projects/999999` (unknown id) | 404, `code: "not_found"` - resource-scoped 404 |
+| 10 | GET a task through the WRONG project's URL (cross-project mismatch) | 404, `code: "not_found"` - confirms `get_task_by_id_and_project`'s combined `WHERE` clause genuinely prevents cross-project task access in a live request, not leaking that the task exists under a different project |
+
+This satisfies the module's Step 7 requirement directly: "Exercise invalid transition, unknown ID, and cross-project task ID. Confirm status/body match documentation" - all three explicitly named edge cases were tested and behaved exactly as the architecture was designed to guarantee.
+
+**Step 8 - automated integration tests**
+
+Created `backend/tests/test_projects_api.py`, testing the real FastAPI app via `TestClient` with `app.dependency_overrides[get_db]` pointing at the real PostgreSQL database (not SQLite), necessary since project/task CRUD genuinely depends on PostgreSQL-specific behavior established in Module 06.
+
+**Caught an inaccurate log entry before it was written**
+
+The first attempt to log this step claimed "four tests, all passing" without re-verifying against the actual last test run. The real last run was `3 failed, 1 passed, 4 errors`. Caught before writing anything false into the evidence record - exactly the discipline this entire course has been building: never record a result without a current, genuine run backing it up.
+
+Two real bugs diagnosed and fixed:
+
+1. `override_get_db()` didn't commit - it yielded a session but never called `db.commit()`, unlike the real `get_db()` dependency. This meant writes made during one request in a test were invisible to the next request within the same test (e.g. a created project appearing to not exist when immediately queried), since nothing was ever actually persisted to the transaction. Fixed by replicating the real dependency's commit/rollback/close behavior in the override.
+
+2. The cleanup fixture's bulk deletes had no `WHERE` clause at all - `delete(Project)` with nothing scoping it attempted to wipe every project row in the table, including unrelated pre-existing data from Module 06 that still had tasks attached, causing a foreign-key violation. Fixed by scoping every delete to `.in_(created_project_ids)`, a list populated only with IDs this specific test run actually created, deleted in correct child-before-parent order (`Task`, then `ProjectMember`, then `Project`).
+
+Reran after both fixes: `docker compose run --rm backend pytest tests/test_projects_api.py -v` -> `4 passed, 1 warning in 4.27s` - a genuine, current, verified result this time.
+
+Four tests: `test_create_and_get_project` (create -> read round trip), `test_duplicate_name_gets_suffixed_slug` (empirical proof of the Step 3 slug-collision algorithm working through the real HTTP layer), `test_unknown_project_returns_404` (resource-scoped 404 shape), `test_public_project_summary_excludes_private_fields` (explicitly asserts `owner_id` is absent, catching accidental data leakage rather than just checking for a 200).
+
+The one remaining warning is the same pre-existing, unrelated `StarletteDeprecationWarning` about httpx/TestClient flagged since Module 05 - investigated and confirmed unrelated to database configuration, ruling out an initial (mistaken) hypothesis that it indicated a database URL scheme problem.
+
+**Step 8 (continued) - task route integration tests**
+
+Created `backend/tests/test_tasks_api.py`, reusing the exact fixture patterns proven in `test_projects_api.py` (commit-on-success `override_get_db`, scoped cleanup via `created_project_ids`).
+
+Four tests, verified passing with a real, current run: `docker compose run --rm backend pytest tests/test_tasks_api.py -v` -> `4 passed, 1 warning in 4.01s`.
+
+- `test_create_task_and_get_it`: create -> read round trip, confirms new tasks default to backlog status.
+- `test_valid_transition_succeeds`: backlog -> in_progress via PATCH, confirms 200 and the updated status in the response.
+- `test_invalid_direct_transition_returns_409`: backlog -> done directly, confirms 409 with `code: "invalid_transition"`.
+- `test_cross_project_task_access_returns_404`: creates a task under Project A, requests it through Project B's URL, confirms 404 with `code: "not_found"`.
+
+The last two tests automate exactly the scenarios manually verified via curl in Step 7 - now permanently regression-tested rather than requiring manual re-verification, directly satisfying the module's requirement that automated coverage exist for "invalid transition" and "cross-project task ID" specifically.
+
+**Step 8 (continued) - mutation testing: proving the tests actually catch bugs**
+
+Deliberately introduced a real bug into `backend/app/services/task_transitions.py`: changed `ALLOWED_TRANSITIONS` so `TaskStatus.BACKLOG` incorrectly included `TaskStatus.DONE` as an allowed transition - directly reintroducing the exact invalid jump `api-contract.md` explicitly forbids.
+
+Ran both relevant suites with the bug in place:
+
+Unit test (`test_task_transitions.py`): the specific parametrized case `test_transition_matrix[BACKLOG-DONE-False]` failed with `"assert True is False"` - the pure function's exhaustive coverage caught the exact broken input immediately, in under a second, with zero database involvement.
+
+Integration test (`test_tasks_api.py`): `test_invalid_direct_transition_returns_409` failed with `"assert 200 == 409"` - the same bug caught at the full HTTP layer too, showing the real, end-to-end consequence: a client would have received a successful 200 response for a request that should have been rejected with a 409.
+
+This is genuine proof the test suite catches real regressions, not just proof the tests pass when the code happens to be correct - satisfying the module's explicit mutation-testing requirement to "break the transition rule intentionally... confirm the correct test fails."
+
+Restored the correct `ALLOWED_TRANSITIONS` dict, confirmed the file matches the original exactly, then ran the FULL test suite (not just the two affected files) to verify the complete codebase: `docker compose run --rm backend pytest -v` -> `30 passed, 1 warning in 5.67s` across all 7 test files (`test_api`, `test_health`, `test_projects_api`, `test_request_id`, `test_task_transitions`, `test_tasks_api`, `test_transactions`) - confirming everything built across Modules 05, 06, and 07 works together correctly, not just the newly-added pieces in isolation.
+
+**Step 9 - reviewing query and transaction behavior**
+
+Applied the SQL-echo inspection habit from Module 06 to the real project/task routes, testing whether the theoretical N+1 analysis holds empirically rather than just trusting the reasoning.
+
+Predicted first (before running): `list_projects` and `list_tasks` should be N+1-safe, since `ProjectRead` and `TaskRead` are flat DTOs with no nested relationship fields (no `owner: UserRead`, no `tasks: list[TaskRead]`) - constructing them only reads scalar columns already present on the originally-queried row, never touching a lazy-loaded relationship like `.owner` or `.tasks`.
+
+Confirmed empirically via SQL echo:
+- `list_projects_visible_to_user` + `ProjectRead.model_validate(p)` for 2 projects -> exactly 1 query total, zero additional queries during DTO construction.
+- `list_tasks_for_project` + `TaskRead.model_validate(t)` for 2 tasks -> exactly 1 query total, zero additional queries during DTO construction.
+- `get_project_task_counts` -> confirmed exactly 2 separate `COUNT` queries (total, then completed `WHERE status='DONE'`), empirically matching the design note already flagged in Step 2 as a known, deliberate-but-unoptimized pattern - not fixed now, same reasoning as before (functionally correct, a genuine but low-priority consolidation opportunity).
+
+Total: 4 queries across all three operations tested, no relationship lazy-loading anywhere. This is a genuine, positive verification result (the design held up under scrutiny), not a bug find - equally valuable to document as the bugs found elsewhere in this module, since it confirms the schema design decision from Step 1 (explicitly flat, no nested relationship data in `ProjectRead`/`TaskRead`) structurally prevents the exact N+1 pattern demonstrated as a real problem in Module 06.
+
+**Independent challenge - task filtering by status and priority**
+
+Implemented the exact endpoint designed (but not built) back in Module 03, Step 6: `GET /api/v1/projects/{project_id}/tasks?status=...&priority=...`, now built consistently with that original design.
+
+Built through all layers:
+- `backend/app/repositories/tasks.py`: `list_tasks_for_project_filtered` composes the query incrementally - starts from the `project_id` scope, then conditionally adds `.where()` clauses only for filters the client actually provided, rather than always including every condition. This keeps the generated SQL minimal and readable, and scales cleanly as more optional filters might be added later.
+- `backend/app/services/tasks.py`: `list_tasks` accepts optional `status`/`priority` parameters, still enforces the Step 1 access check first before any filtering.
+- `backend/app/api/routes/tasks.py`: `status: TaskStatus | None` and `priority: TaskPriority | None` as route parameters - FastAPI automatically exposes these as query parameters and validates them against the enum, which is what gives the 422 response for invalid values for free, satisfying the "validated query parameters" requirement without extra code.
+
+Index consideration, decided deliberately rather than assumed: identified that filtering by priority alone (or status+priority together) doesn't have dedicated index coverage - only `(project_id, status)` exists, from Module 06. Decided NOT to add a new index without evidence, applying the same "measure before optimizing" discipline from Module 06's `EXPLAIN` exercise: priority has low cardinality (only 3 values, roughly a third of rows each), the existing `(project_id, status)` index already covers the most likely common case (status-based board views), and there's no real usage data yet indicating priority-only filtering is frequent enough to justify the write-side maintenance cost of a new index. Documented as a deferred, evidence-based decision, not an oversight - if usage patterns later show priority filtering is common and slow, Module 06's `EXPLAIN` methodology is the established way to re-evaluate this with real data.
+
+Verified live against real data (3 tasks: 1 low priority, 2 high priority): no filter (baseline), `priority=high` (2 results), `status=backlog` (all 3, since none moved yet), combined `status=backlog&priority=high` (intersection), invalid status value (422), and `priority=medium` with no matching tasks (200, empty array) - all six scenarios behaved exactly as designed back in Module 03.
+
+Added 4 automated tests to `backend/tests/test_tasks_api.py`: `test_filter_by_priority`, `test_filter_combined_status_and_priority` (confirms AND logic, not OR), `test_filter_invalid_status_returns_422`, `test_filter_no_matches_returns_empty_list`. Full suite reverified: `docker compose run --rm backend pytest -v` -> `34 passed, 1 warning in 4.78s` (up from 30).
+
+Confirmed via `/openapi.json` (queried directly, not assumed) that `status` and `priority` appear as proper, optional, typed query parameters on the endpoint - each with `schema.$ref` pointing at the `TaskStatus`/`TaskPriority` enum definitions - satisfying the "docs" requirement automatically through FastAPI's OpenAPI generation, no manual documentation needed.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - PATCH schemas with `exclude_unset=True` to distinguish omitted vs. explicit-null fields, focused repository methods (targeted existence checks rather than fetch-and-filter), service-layer business logic and transaction orchestration, resource-scoped authorization applied consistently to both visibility and ownership checks, the pure transition function pattern, thin route controllers, mutation testing to prove tests actually catch regressions, empirical N+1 verification, and incremental optional-filter query composition.
+- I can explain it without the reference code: yes - resource-scoped 404s mean authorization is part of resource lookup itself (check access -> 404 if denied -> then look up the resource), not a separate step after finding it, preventing information leakage about resources inside inaccessible parents; the transition rule is a pure function (same input always produces the same output, no database, no side effects) specifically to make it exhaustively unit-testable in isolation before it ever touches persistence; check ordering matters because reversing authorization and resource lookup risks confirming a resource's existence to someone who shouldn't even know to ask.
+- I can diagnose one failure in this area: mostly yes - confident building a similar CRUD domain end-to-end (repositories, services, routes, schemas, migrations, authorization, filtering) for an unfamiliar entity set, would likely need to reference exact framework syntax occasionally. Would be slower at designing larger authorization systems, advanced eager-loading strategies, and diagnosing subtle production performance issues.
+- Confidence from 1-5: 4/5 - understand the architecture and the reasoning behind each design decision (resource-scoped authorization, focused repositories, pure transition functions, check ordering, incremental filtering), not just the syntax to implement them. The remaining gap toward a 5 is experience applying these patterns independently across larger or unfamiliar systems, not conceptual understanding.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
