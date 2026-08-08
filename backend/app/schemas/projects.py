@@ -1,4 +1,5 @@
 """Pydantic schemas for the Project resource."""
+
 from datetime import datetime
 
 from pydantic import BaseModel, Field

@@ -1,4 +1,5 @@
 """Focused query operations for the Project resource."""
+
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -10,9 +11,7 @@ def get_project_by_id(db: Session, project_id: int) -> Project | None:
 
 
 def get_project_by_slug(db: Session, slug: str) -> Project | None:
-    return db.execute(
-        select(Project).where(Project.slug == slug)
-    ).scalar_one_or_none()
+    return db.execute(select(Project).where(Project.slug == slug)).scalar_one_or_none()
 
 
 def list_projects_visible_to_user(db: Session, user_id: int) -> list[Project]:

@@ -1,4 +1,5 @@
 """Pure function governing allowed task status transitions."""
+
 from app.db.models import TaskStatus
 
 ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {

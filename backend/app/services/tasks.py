@@ -1,4 +1,5 @@
 """Task-related service operations."""
+
 from datetime import date
 from typing import Any
 
@@ -12,8 +13,14 @@ from app.services.task_transitions import is_transition_allowed
 
 
 def create_task(
-    db: Session, project_id: int, user_id: int, title: str, description: str | None,
-    priority: TaskPriority, assignee_id: int | None, due_date: date | None,
+    db: Session,
+    project_id: int,
+    user_id: int,
+    title: str,
+    description: str | None,
+    priority: TaskPriority,
+    assignee_id: int | None,
+    due_date: date | None,
 ) -> Task:
     get_visible_project_or_404(db, project_id, user_id)  # step 1: verify project access
 
@@ -37,14 +44,20 @@ def list_tasks(db: Session, project_id: int, user_id: int) -> list[Task]:
 
 def get_task_or_404(db: Session, project_id: int, task_id: int, user_id: int) -> Task:
     get_visible_project_or_404(db, project_id, user_id)  # step 1: verify project access
-    task = get_task_by_id_and_project(db, project_id, task_id)  # step 2: task belongs to project
+    task = get_task_by_id_and_project(
+        db, project_id, task_id
+    )  # step 2: task belongs to project
     if task is None:
         raise NotFoundError(f"Task {task_id} not found in project {project_id}")
     return task
 
 
 def update_task(
-    db: Session, project_id: int, task_id: int, user_id: int, update_data: dict[str, Any]
+    db: Session,
+    project_id: int,
+    task_id: int,
+    user_id: int,
+    update_data: dict[str, Any],
 ) -> Task:
     task = get_task_or_404(db, project_id, task_id, user_id)  # steps 1 and 2
 

@@ -1,4 +1,5 @@
 """Project-related service operations."""
+
 import re
 from typing import Any
 

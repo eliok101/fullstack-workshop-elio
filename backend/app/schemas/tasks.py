@@ -1,4 +1,5 @@
 """Pydantic schemas for the Task resource."""
+
 from datetime import date, datetime
 
 from pydantic import BaseModel, Field

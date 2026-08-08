@@ -1,4 +1,5 @@
 """Exhaustive unit tests for the task status transition rule - no database involved."""
+
 import pytest
 
 from app.db.models import TaskStatus
