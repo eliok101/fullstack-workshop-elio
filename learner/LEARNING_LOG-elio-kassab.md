@@ -1097,6 +1097,22 @@ Critical security reasoning for filtering on both IDs together rather than fetch
 
 Design decision: no add/delete/flush wrapper functions were added to either repository file (`projects.py` or `tasks.py`). `db.add()`/`db.delete()` calls will happen directly in the service layer via the already-injected `Session`, rather than through trivial repository pass-through functions like `add_task(db, task): db.add(task)` - the module explicitly warns against "creating generic abstractions before repeated behavior exists," and a one-line wrapper around a single SQLAlchemy call adds no domain value.
 
+**Step 3 - project service**
+
+Rewrote `backend/app/services/projects.py`, replacing Module 06's original `create_project_with_owner` (which had a `slug` parameter and a test-only `simulate_failure` flag) with the real implementation:
+
+- `slugify(name)` + `generate_unique_slug(db, name)`: deterministic slug generation (lowercase, non-alphanumeric characters collapsed to hyphens) with a deterministic collision-handling sequence (`website-redesign` -> `website-redesign-2` -> `website-redesign-3`, etc.) rather than random suffixes - determinism matters because the uniqueness-check loop (generate candidate -> check existence -> increment if taken) requires predictable, testable candidates.
+- `create_project_with_owner(db, name, description, is_public, owner_id)`: generates the slug server-side, creates the `Project`, flushes to populate its `id`, then creates the owner `ProjectMember` row - reusing the exact flush-before-commit atomicity pattern proven in Module 06.
+- `get_visible_project_or_404`: wraps repository lookup + visibility check, raising `NotFoundError` (not `ForbiddenError`) if the project doesn't exist OR isn't visible to the user - a resource-scoped 404 per the Module 03 pattern, so a private project's existence is never confirmed to an unauthorized caller.
+- `update_project` / `delete_project`: both raise `NotFoundError` (not `ForbiddenError`) when the requesting user isn't the project owner - same resource-scoped 404 reasoning applied to authorization failures, not just visibility failures. `update_project` takes `update_data: dict[str, Any]` rather than the raw `ProjectUpdate` schema directly - the translation from "schema with omitted vs. explicit-null fields" to "only the fields the client actually sent" (via `model_fields_set`) will happen in the route layer, not here, since deciding which fields were present in the HTTP request is fundamentally a request-parsing concern.
+- `get_public_project_summary`: looks up by slug, verifies `is_public`, and assembles a `ProjectPublicSummary` manually using `get_project_task_counts`, since (per Step 1) that schema's fields aren't direct `Project` model attributes.
+
+**Fixing a regression this rewrite caused**
+
+Changing `create_project_with_owner`'s signature broke Module 06's existing `test_transactions.py`, which called the old signature (`slug=...`, `simulate_failure=True/False`) - neither parameter exists anymore. Fixed by rewriting the test to use a genuinely stronger atomicity proof: instead of an artificial `simulate_failure` flag that only exists in test code, the failure test now passes a nonexistent `owner_id` (999999), triggering a real PostgreSQL foreign-key constraint violation (`sqlalchemy.exc.IntegrityError`) when `create_project_with_owner` tries to flush the project insert. This is a more valuable test than the original, since it exercises the actual production failure path (a genuine database constraint) rather than a hand-injected exception that could never occur outside of tests - verifying that SQLAlchemy, PostgreSQL's constraint enforcement, exception propagation, and session rollback all work together correctly, not just that raising an exception triggers a rollback in isolation.
+
+Both tests re-verified against real PostgreSQL: `docker compose run --rm backend pytest tests/test_transactions.py -v` -> `2 passed in 2.53s`.
+
 ---
 
 ## Module entry template
