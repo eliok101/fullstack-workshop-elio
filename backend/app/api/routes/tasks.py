@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
+from app.db.models import TaskPriority, TaskStatus
 from app.db.session import get_db
 from app.schemas.tasks import TaskCreate, TaskRead, TaskUpdate
 from app.services.tasks import (
@@ -20,9 +21,14 @@ FAKE_CURRENT_USER_ID = 1  # temporary until Module 08 authentication - requires 
 
 @router.get("/projects/{project_id}/tasks", response_model=list[TaskRead])
 def list_project_tasks(
-    project_id: int, db: Session = Depends(get_db)
+    project_id: int,
+    status: TaskStatus | None = None,
+    priority: TaskPriority | None = None,
+    db: Session = Depends(get_db),
 ) -> list[TaskRead]:
-    tasks = list_tasks(db, project_id, FAKE_CURRENT_USER_ID)
+    tasks = list_tasks(
+        db, project_id, FAKE_CURRENT_USER_ID, status=status, priority=priority
+    )
     return [TaskRead.model_validate(t) for t in tasks]
 
 

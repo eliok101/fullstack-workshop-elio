@@ -6,8 +6,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import InvalidTransitionError, NotFoundError
-from app.db.models import Task, TaskPriority
-from app.repositories.tasks import get_task_by_id_and_project, list_tasks_for_project
+from app.db.models import Task, TaskPriority, TaskStatus
+from app.repositories.tasks import (
+    get_task_by_id_and_project,
+    list_tasks_for_project_filtered,
+)
 from app.services.projects import get_visible_project_or_404
 from app.services.task_transitions import is_transition_allowed
 
@@ -37,9 +40,15 @@ def create_task(
     return task
 
 
-def list_tasks(db: Session, project_id: int, user_id: int) -> list[Task]:
+def list_tasks(
+    db: Session,
+    project_id: int,
+    user_id: int,
+    status: TaskStatus | None = None,
+    priority: TaskPriority | None = None,
+) -> list[Task]:
     get_visible_project_or_404(db, project_id, user_id)  # step 1: verify project access
-    return list_tasks_for_project(db, project_id)
+    return list_tasks_for_project_filtered(db, project_id, status, priority)
 
 
 def get_task_or_404(db: Session, project_id: int, task_id: int, user_id: int) -> Task:

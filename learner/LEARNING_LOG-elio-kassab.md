@@ -1234,6 +1234,23 @@ Confirmed empirically via SQL echo:
 
 Total: 4 queries across all three operations tested, no relationship lazy-loading anywhere. This is a genuine, positive verification result (the design held up under scrutiny), not a bug find - equally valuable to document as the bugs found elsewhere in this module, since it confirms the schema design decision from Step 1 (explicitly flat, no nested relationship data in `ProjectRead`/`TaskRead`) structurally prevents the exact N+1 pattern demonstrated as a real problem in Module 06.
 
+**Independent challenge - task filtering by status and priority**
+
+Implemented the exact endpoint designed (but not built) back in Module 03, Step 6: `GET /api/v1/projects/{project_id}/tasks?status=...&priority=...`, now built consistently with that original design.
+
+Built through all layers:
+- `backend/app/repositories/tasks.py`: `list_tasks_for_project_filtered` composes the query incrementally - starts from the `project_id` scope, then conditionally adds `.where()` clauses only for filters the client actually provided, rather than always including every condition. This keeps the generated SQL minimal and readable, and scales cleanly as more optional filters might be added later.
+- `backend/app/services/tasks.py`: `list_tasks` accepts optional `status`/`priority` parameters, still enforces the Step 1 access check first before any filtering.
+- `backend/app/api/routes/tasks.py`: `status: TaskStatus | None` and `priority: TaskPriority | None` as route parameters - FastAPI automatically exposes these as query parameters and validates them against the enum, which is what gives the 422 response for invalid values for free, satisfying the "validated query parameters" requirement without extra code.
+
+Index consideration, decided deliberately rather than assumed: identified that filtering by priority alone (or status+priority together) doesn't have dedicated index coverage - only `(project_id, status)` exists, from Module 06. Decided NOT to add a new index without evidence, applying the same "measure before optimizing" discipline from Module 06's `EXPLAIN` exercise: priority has low cardinality (only 3 values, roughly a third of rows each), the existing `(project_id, status)` index already covers the most likely common case (status-based board views), and there's no real usage data yet indicating priority-only filtering is frequent enough to justify the write-side maintenance cost of a new index. Documented as a deferred, evidence-based decision, not an oversight - if usage patterns later show priority filtering is common and slow, Module 06's `EXPLAIN` methodology is the established way to re-evaluate this with real data.
+
+Verified live against real data (3 tasks: 1 low priority, 2 high priority): no filter (baseline), `priority=high` (2 results), `status=backlog` (all 3, since none moved yet), combined `status=backlog&priority=high` (intersection), invalid status value (422), and `priority=medium` with no matching tasks (200, empty array) - all six scenarios behaved exactly as designed back in Module 03.
+
+Added 4 automated tests to `backend/tests/test_tasks_api.py`: `test_filter_by_priority`, `test_filter_combined_status_and_priority` (confirms AND logic, not OR), `test_filter_invalid_status_returns_422`, `test_filter_no_matches_returns_empty_list`. Full suite reverified: `docker compose run --rm backend pytest -v` -> `34 passed, 1 warning in 4.78s` (up from 30).
+
+Confirmed via `/openapi.json` (queried directly, not assumed) that `status` and `priority` appear as proper, optional, typed query parameters on the endpoint - each with `schema.$ref` pointing at the `TaskStatus`/`TaskPriority` enum definitions - satisfying the "docs" requirement automatically through FastAPI's OpenAPI generation, no manual documentation needed.
+
 ---
 
 ## Module entry template

@@ -113,3 +113,65 @@ def test_cross_project_task_access_returns_404(seed_user_and_cleanup):
     response = client.get(f"/api/v1/projects/{project_b['id']}/tasks/{task['id']}")
     assert response.status_code == 404
     assert response.json()["code"] == "not_found"
+
+
+def test_filter_by_priority(seed_user_and_cleanup):
+    project = _create_project(seed_user_and_cleanup, "Filter Priority Project")
+    client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "Low", "priority": "low"},
+    )
+    client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "High 1", "priority": "high"},
+    )
+    client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "High 2", "priority": "high"},
+    )
+
+    response = client.get(f"/api/v1/projects/{project['id']}/tasks?priority=high")
+    assert response.status_code == 200
+    tasks = response.json()
+    assert len(tasks) == 2
+    assert all(t["priority"] == "high" for t in tasks)
+
+
+def test_filter_combined_status_and_priority(seed_user_and_cleanup):
+    project = _create_project(seed_user_and_cleanup, "Filter Combined Project")
+    task = client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "Backlog High", "priority": "high"},
+    ).json()
+    client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "Backlog Low", "priority": "low"},
+    )
+
+    response = client.get(
+        f"/api/v1/projects/{project['id']}/tasks?status=backlog&priority=high"
+    )
+    assert response.status_code == 200
+    tasks = response.json()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == task["id"]
+
+
+def test_filter_invalid_status_returns_422(seed_user_and_cleanup):
+    project = _create_project(seed_user_and_cleanup, "Filter Invalid Project")
+    response = client.get(
+        f"/api/v1/projects/{project['id']}/tasks?status=not_a_real_status"
+    )
+    assert response.status_code == 422
+
+
+def test_filter_no_matches_returns_empty_list(seed_user_and_cleanup):
+    project = _create_project(seed_user_and_cleanup, "Filter No Match Project")
+    client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "Only Task", "priority": "low"},
+    )
+
+    response = client.get(f"/api/v1/projects/{project['id']}/tasks?priority=medium")
+    assert response.status_code == 200
+    assert response.json() == []
