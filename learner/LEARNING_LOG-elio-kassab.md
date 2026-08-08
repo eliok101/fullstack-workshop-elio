@@ -1025,6 +1025,25 @@ This is a concrete case for why relationship loading strategy matters once real 
 
 Bonus verification: cleaned up test data with a real commit (not rollback), which also empirically confirmed the `cascade="all, delete-orphan"` design decision from Step 3 actually works - deleting the 3 test projects correctly cascade-deleted their 6 associated tasks without needing to delete them explicitly.
 
+**Independent challenge - EXPLAIN evidence for the (project_id, status) index**
+
+Generated 8000 test tasks across two projects (target project id 7, ~2667 tasks) with randomly assigned status values, to give PostgreSQL's query planner enough data for a meaningful before/after comparison - a tiny table would likely favor a sequential scan regardless of index presence, since scanning a handful of rows is cheaper than using an index.
+
+Ran `EXPLAIN (ANALYZE, BUFFERS)` for the same query (`WHERE project_id = 7 AND status = 'BACKLOG'`) with the composite index dropped, then restored:
+
+Note: caught and corrected a data issue mid-exercise - SQLAlchemy's `Enum` type stores the Python enum member's `.name` (e.g. `"BACKLOG"`) in PostgreSQL by default, not its `.value` (`"backlog"`), so the query needed to match the stored uppercase form.
+
+Before (single-column `ix_tasks_project_id` only):
+- `Bitmap Index Scan` on `ix_tasks_project_id` finds all 2667 rows for `project_id = 7`, then a `Filter` step discards 1737 of them post-scan to match `status = 'BACKLOG'`.
+- Execution Time: 1.789 ms
+
+After (composite `ix_tasks_project_id_status` restored):
+- `Bitmap Index Scan` on `ix_tasks_project_id_status` uses `Index Cond: ((project_id = 7) AND (status = 'BACKLOG'))` - both conditions are satisfied directly by the index, fetching only the ~930 matching rows.
+- `Rows Removed by Filter: 1737` disappears entirely - no post-scan filtering needed.
+- Execution Time: 1.050 ms (~41% faster on this dataset)
+
+Write/storage cost discussion: the composite index adds overhead on every INSERT/UPDATE/DELETE to `tasks` (the index must be maintained alongside the data), and consumes additional disk space proportional to table size. This tradeoff is worthwhile here because task listing/filtering by project and status is a core, frequent read pattern for this application (matches the actual Workboard UI's task board view), while task writes are comparatively infrequent - the read-heavy access pattern justifies the write-side index-maintenance cost.
+
 ---
 
 ## Module entry template
