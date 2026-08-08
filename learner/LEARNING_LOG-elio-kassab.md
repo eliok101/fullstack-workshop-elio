@@ -992,6 +992,20 @@ Full lifecycle verified against the real database, including direct `psql` inspe
 | `alembic upgrade head` (reapply) | Clean, `27edc82c2b1b -> 4840454901bd` again |
 | `alembic check` | `No new upgrade operations detected` - final state matches models exactly |
 
+**Step 7 - transaction atomicity test**
+
+Created `backend/app/services/projects.py`, establishing the `services/` layer (matching `docs/architecture.md`'s Router -> Schema -> Dependency -> Service -> Repository -> Model layering from Module 00). `create_project_with_owner(db, name, slug, owner_id, simulate_failure)` creates a `Project`, flushes it (populating `project.id` without committing), then either raises a deliberate `RuntimeError` (`simulate_failure=True`) before creating the `ProjectMember` row, or creates the membership normally.
+
+Key concept verified: `db.flush()` sends INSERT statements to PostgreSQL within the current transaction, making them visible to that transaction, but they remain impermanent until `db.commit()`. If an exception is raised after `flush()` but before `commit()`, a subsequent `rollback()` discards everything the transaction did, including already-flushed inserts - this is why raising mid-function, before any explicit commit, is sufficient to guarantee atomicity, without needing to manually track or undo the first insert.
+
+Created `backend/tests/test_transactions.py`, run against the REAL PostgreSQL database (not SQLite) via `docker compose run`, per the module's explicit warning that "assuming SQLite proves PostgreSQL behavior" is a common failure mode - transaction semantics need to be tested against the actual database engine being used in production.
+
+Two tests, both passing:
+- `test_failure_rolls_back_both_inserts`: calls `create_project_with_owner` with `simulate_failure=True`, catches the expected `RuntimeError`, rolls back, then queries the database directly and confirms neither the `Project` row nor the `ProjectMember` row exists.
+- `test_success_commits_both_inserts`: calls the same function with `simulate_failure=False`, confirms both rows exist with correct data (including the membership's `role="owner"`), proving the normal success path still works correctly using the identical code path as the failure test - not a special test-only implementation.
+
+Result: `docker compose run --rm backend pytest tests/test_transactions.py -v` -> `2 passed in 1.84s`. This is direct, empirical proof of atomicity, not inference from code review - satisfying the validation checklist item "project plus owner membership is atomic under an injected failure."
+
 ---
 
 ## Module entry template
