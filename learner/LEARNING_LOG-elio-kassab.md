@@ -1053,6 +1053,52 @@ Write/storage cost discussion: the composite index adds overhead on every INSERT
 
 ---
 
+### Module 07 — Backend domain architecture and CRUD
+
+**Date and branch**
+
+- Date: 2026-08-08
+- Branch: learning/07-backend-domain
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Implement real project and task CRUD workflows through the full router -> schema -> service -> repository -> model layering, enforce business rules and transaction ownership in services, return consistent resource-scoped error responses without leaking private resource existence, and build tested list/create/read/update/delete behavior.
+
+**Work completed so far**
+
+Step 1 - external schemas:
+
+Created `backend/app/schemas/projects.py` (`ProjectCreate`, `ProjectUpdate`, `ProjectRead`, `ProjectPublicSummary`) and `backend/app/schemas/tasks.py` (`TaskCreate`, `TaskUpdate`, `TaskRead`), matching `database-design.md`'s models exactly while explicitly excluding internal-only fields.
+
+Three deliberate design decisions confirmed, not left as accidental gaps:
+
+1. `slug` is absent from `ProjectCreate` - slug generation is server-side (service layer), not client-supplied, per `database-design.md`'s design decision.
+
+2. `ProjectPublicSummary` (`task_count`, `completed_task_count`) cannot be built via `model_validate(project)`/`from_attributes`, since those are computed aggregates, not direct `Project` model attributes - this schema will need to be assembled manually from a dedicated repository query, not validated straight from an ORM object.
+
+3. The "field omitted vs. explicitly set to null" problem (`ProjectUpdate.description`, `TaskUpdate.assignee_id`): a plain `Optional` field can't distinguish a client that didn't send a field from one that explicitly sent `null` to clear it - both collapse to the same `None` value after Pydantic parsing. This matters most for `TaskUpdate.assignee_id`, since unassigning a task is a common real action, not an edge case. Resolved architecturally, not in the schema itself: the service layer (Steps 3 and 5) will use `model_fields_set` to check which fields were actually present in the request before deciding what to update.
+
+4. `TaskUpdate.status` accepts any valid `TaskStatus` enum value at the schema level (Pydantic validates it's a real status), but does NOT enforce which transitions are legal (e.g. rejecting `backlog -> done`) - that's a stateful rule depending on the task's current status, which a schema validator can't see in isolation. Consistent with the layer-placement reasoning from Module 06: shape/type validation belongs in Pydantic, but a rule that depends on existing state belongs in the service layer via the dedicated pure transition function required by Step 4.
+
+**Step 2 - repositories**
+
+Created `backend/app/repositories/projects.py` with focused query functions (not a generic repository abstraction, per the module's explicit warning): `get_project_by_id`, `get_project_by_slug`, `list_projects_visible_to_user` (OR of ownership and membership, via `outerjoin` + `distinct` to avoid duplicate rows when a user is both owner and has a membership row), `is_project_visible_to_user` (a dedicated targeted existence check), `get_project_task_counts` (resolving the `ProjectPublicSummary` aggregate gap from Step 1), `slug_exists`, and `get_user_by_email`.
+
+Design reasoning for the dedicated `is_project_visible_to_user` query rather than reusing `list_projects_visible_to_user` and checking membership in the result: a single-resource endpoint like `GET /api/v1/projects/{project_id}` only needs to answer one yes/no question. Reusing the list query would fetch and construct every visible project (potentially hundreds) just to check if one specific ID is among them - wasted I/O, wasted object construction, wasted data transfer. A targeted existence query lets the database use indexes and stop as soon as it finds one matching row, which matters significantly for a single-resource endpoint that will be called far more frequently than the list endpoint.
+
+Noted for later review (Step 9): `get_project_task_counts` currently runs two separate `COUNT` queries rather than one grouped/conditional query - functionally correct, flagged as a potential query-consolidation opportunity rather than fixed now.
+
+**Step 2 (continued) - task repository and add/delete design decision**
+
+Created `backend/app/repositories/tasks.py` with `get_task_by_id_and_project` (filters on BOTH `Task.id` and `Task.project_id` in a single `WHERE` clause) and `list_tasks_for_project`.
+
+Critical security reasoning for filtering on both IDs together rather than fetching by `task_id` alone and checking `project_id` afterward: doing it as two separate steps would mean fetching a task's data before deciding it isn't accessible via this path - a subtle problem even if the data is never returned to the caller. Filtering on both in one query means a mismatched `task_id`/`project_id` combination (e.g. requesting `/projects/5/tasks/99` when task 99 actually belongs to project 3) returns nothing at all - the caller cannot distinguish "task doesn't exist" from "task exists but isn't in this project," which is exactly the resource-scoped 404 semantics designed in Module 03. This directly satisfies the module's validation checklist item "a task cannot be addressed through the wrong project path."
+
+Design decision: no add/delete/flush wrapper functions were added to either repository file (`projects.py` or `tasks.py`). `db.add()`/`db.delete()` calls will happen directly in the service layer via the already-injected `Session`, rather than through trivial repository pass-through functions like `add_task(db, task): db.add(task)` - the module explicitly warns against "creating generic abstractions before repeated behavior exists," and a one-line wrapper around a single SQLAlchemy call adds no domain value.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
