@@ -1174,6 +1174,53 @@ Full walkthrough results, all 10 scenarios:
 
 This satisfies the module's Step 7 requirement directly: "Exercise invalid transition, unknown ID, and cross-project task ID. Confirm status/body match documentation" - all three explicitly named edge cases were tested and behaved exactly as the architecture was designed to guarantee.
 
+**Step 8 - automated integration tests**
+
+Created `backend/tests/test_projects_api.py`, testing the real FastAPI app via `TestClient` with `app.dependency_overrides[get_db]` pointing at the real PostgreSQL database (not SQLite), necessary since project/task CRUD genuinely depends on PostgreSQL-specific behavior established in Module 06.
+
+**Caught an inaccurate log entry before it was written**
+
+The first attempt to log this step claimed "four tests, all passing" without re-verifying against the actual last test run. The real last run was `3 failed, 1 passed, 4 errors`. Caught before writing anything false into the evidence record - exactly the discipline this entire course has been building: never record a result without a current, genuine run backing it up.
+
+Two real bugs diagnosed and fixed:
+
+1. `override_get_db()` didn't commit - it yielded a session but never called `db.commit()`, unlike the real `get_db()` dependency. This meant writes made during one request in a test were invisible to the next request within the same test (e.g. a created project appearing to not exist when immediately queried), since nothing was ever actually persisted to the transaction. Fixed by replicating the real dependency's commit/rollback/close behavior in the override.
+
+2. The cleanup fixture's bulk deletes had no `WHERE` clause at all - `delete(Project)` with nothing scoping it attempted to wipe every project row in the table, including unrelated pre-existing data from Module 06 that still had tasks attached, causing a foreign-key violation. Fixed by scoping every delete to `.in_(created_project_ids)`, a list populated only with IDs this specific test run actually created, deleted in correct child-before-parent order (`Task`, then `ProjectMember`, then `Project`).
+
+Reran after both fixes: `docker compose run --rm backend pytest tests/test_projects_api.py -v` -> `4 passed, 1 warning in 4.27s` - a genuine, current, verified result this time.
+
+Four tests: `test_create_and_get_project` (create -> read round trip), `test_duplicate_name_gets_suffixed_slug` (empirical proof of the Step 3 slug-collision algorithm working through the real HTTP layer), `test_unknown_project_returns_404` (resource-scoped 404 shape), `test_public_project_summary_excludes_private_fields` (explicitly asserts `owner_id` is absent, catching accidental data leakage rather than just checking for a 200).
+
+The one remaining warning is the same pre-existing, unrelated `StarletteDeprecationWarning` about httpx/TestClient flagged since Module 05 - investigated and confirmed unrelated to database configuration, ruling out an initial (mistaken) hypothesis that it indicated a database URL scheme problem.
+
+**Step 8 (continued) - task route integration tests**
+
+Created `backend/tests/test_tasks_api.py`, reusing the exact fixture patterns proven in `test_projects_api.py` (commit-on-success `override_get_db`, scoped cleanup via `created_project_ids`).
+
+Four tests, verified passing with a real, current run: `docker compose run --rm backend pytest tests/test_tasks_api.py -v` -> `4 passed, 1 warning in 4.01s`.
+
+- `test_create_task_and_get_it`: create -> read round trip, confirms new tasks default to backlog status.
+- `test_valid_transition_succeeds`: backlog -> in_progress via PATCH, confirms 200 and the updated status in the response.
+- `test_invalid_direct_transition_returns_409`: backlog -> done directly, confirms 409 with `code: "invalid_transition"`.
+- `test_cross_project_task_access_returns_404`: creates a task under Project A, requests it through Project B's URL, confirms 404 with `code: "not_found"`.
+
+The last two tests automate exactly the scenarios manually verified via curl in Step 7 - now permanently regression-tested rather than requiring manual re-verification, directly satisfying the module's requirement that automated coverage exist for "invalid transition" and "cross-project task ID" specifically.
+
+**Step 8 (continued) - mutation testing: proving the tests actually catch bugs**
+
+Deliberately introduced a real bug into `backend/app/services/task_transitions.py`: changed `ALLOWED_TRANSITIONS` so `TaskStatus.BACKLOG` incorrectly included `TaskStatus.DONE` as an allowed transition - directly reintroducing the exact invalid jump `api-contract.md` explicitly forbids.
+
+Ran both relevant suites with the bug in place:
+
+Unit test (`test_task_transitions.py`): the specific parametrized case `test_transition_matrix[BACKLOG-DONE-False]` failed with `"assert True is False"` - the pure function's exhaustive coverage caught the exact broken input immediately, in under a second, with zero database involvement.
+
+Integration test (`test_tasks_api.py`): `test_invalid_direct_transition_returns_409` failed with `"assert 200 == 409"` - the same bug caught at the full HTTP layer too, showing the real, end-to-end consequence: a client would have received a successful 200 response for a request that should have been rejected with a 409.
+
+This is genuine proof the test suite catches real regressions, not just proof the tests pass when the code happens to be correct - satisfying the module's explicit mutation-testing requirement to "break the transition rule intentionally... confirm the correct test fails."
+
+Restored the correct `ALLOWED_TRANSITIONS` dict, confirmed the file matches the original exactly, then ran the FULL test suite (not just the two affected files) to verify the complete codebase: `docker compose run --rm backend pytest -v` -> `30 passed, 1 warning in 5.67s` across all 7 test files (`test_api`, `test_health`, `test_projects_api`, `test_request_id`, `test_task_transitions`, `test_tasks_api`, `test_transactions`) - confirming everything built across Modules 05, 06, and 07 works together correctly, not just the newly-added pieces in isolation.
+
 ---
 
 ## Module entry template
