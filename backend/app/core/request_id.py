@@ -1,4 +1,5 @@
 """Request ID middleware for end-to-end request tracing."""
+
 import uuid
 from collections.abc import Awaitable, Callable
 

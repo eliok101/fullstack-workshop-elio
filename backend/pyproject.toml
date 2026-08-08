@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "FastAPI health-check starter for the full-stack intern workshop"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+  "alembic==1.14.1",
   "fastapi==0.139.2",
   "pydantic-settings==2.14.2",
   "psycopg[binary]==3.3.4",

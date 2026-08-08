@@ -872,6 +872,187 @@ Full suite now: `11 passed, 1 warning` (the same pre-existing, unrelated `Starle
 
 ---
 
+### Module 06 — PostgreSQL, SQLAlchemy, and Alembic
+
+**Date and branch**
+
+- Date: 2026-08-06
+- Branch: learning/06-data-and-migrations
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Model the real Workboard entities (users, projects, memberships, tasks, comments) with correct constraints and relationships, configure SQLAlchemy sessions safely, create and exercise a full Alembic migration lifecycle including downgrade, and prove transaction atomicity under a deliberate failure.
+
+**Work completed so far**
+
+Step 1 - design before coding, rule-placement classification:
+
+Practiced classifying business rules into the correct enforcement layer (Pydantic / service / database / frontend) before writing any code, per `database-design.md`'s guidance that a rule can exist in multiple layers for different purposes, but backend enforcement is authoritative.
+
+| Rule | Primary layer | Reasoning |
+|---|---|---|
+| Task cannot transition backlog -> done directly | Service | A business workflow rule - requires knowing both current and requested state, which Pydantic can't see and the database shouldn't encode as business logic. Frontend can hide the option for UX, but the backend must still enforce it since the API can be called directly. |
+| Email must be unique | Database (primary), Service (secondary) | Database UNIQUE constraint is the authoritative guarantee, immune to race conditions. A service-layer pre-check exists only to produce a friendlier error message before hitting the database, not as the real safety net. |
+| Project owner cannot be removed from project_members | Service | Depends on the member's role - a business rule requiring lookup and decision logic, not something a raw database constraint or Pydantic schema check can express. |
+| due_date must be a valid date, if provided | Pydantic | Pure shape/format validation (`date \| None`) - rejects malformed values (invalid calendar dates, wrong types) before the request ever reaches the service or database layer. |
+
+**Cardinality analysis: Users <-> Projects via project_members**
+
+Users and Projects have a many-to-many relationship: a user can belong to many projects, and a project can have many users. This can't be represented with a simple foreign key on either side, so it requires a junction/join table (`project_members`).
+
+Why `project_members` uses a composite primary key (`project_id`, `user_id`) instead of its own auto-incrementing `id`: the composite key IS the row's identity - the combination itself is what must be unique, expressing "this user is a member of this project" directly. An auto-incrementing `id` alone would not prevent duplicate membership rows (the same `project_id`/`user_id` pair inserted twice) unless a separate unique constraint were added on top of it anyway - so the composite primary key is both more natural (no redundant surrogate key for a pure relationship table) and self-enforcing, rather than needing an extra constraint bolted on afterward.
+
+**Step 2 - engine and session configuration**
+
+Extended `backend/app/db/session.py` with `SessionLocal` (a `sessionmaker` bound to the existing engine, `autoflush=False`, `expire_on_commit=False`) and `get_db()`, a generator-based session dependency compatible with FastAPI's `Depends()`: yields a session, commits on clean completion, rolls back and re-raises on any exception, always closes in a `finally` block. This is the "one session per request" pattern - the alternative (one global session shared across requests) would cause transaction interference between concurrent users, rollback contamination (one user's error undoing another user's uncommitted work), stale cached objects, and race conditions, since SQLAlchemy sessions are not thread-safe and represent a single unit of work.
+
+`autoflush=False` chosen deliberately: the SQLAlchemy default (`autoflush=True`) would automatically write pending changes to the database before any query runs within the same session, which could push unvalidated data to the database mid-request (e.g. before business-rule validation completes). Disabling it means nothing is written until an explicit `flush()` or `commit()`, giving predictable control over when writes actually happen.
+
+Verification, in two stages:
+1. First pass tested the generator's control-flow contract (clean completion on success, exception re-propagation on failure) - this passed but only inferred that commit/rollback ran, without directly proving it.
+2. Recognized this gap and re-verified with a mock-patched version, asserting directly on `SessionLocal`'s mocked `commit`/`rollback`/`close` calls:
+   - Success path: `commit()` called, `rollback()` NOT called, `close()` called.
+   - Failure path: `commit()` NOT called, `rollback()` called, `close()` called.
+
+This is a concrete example of the difference between evidence that looks convincing and evidence that's actually conclusive - the first test could theoretically have passed even with a subtly broken commit/rollback implementation, as long as the generator's yield/exception timing happened to match; only direct assertion on the actual method calls closes that gap.
+
+**Step 3 - SQLAlchemy models**
+
+Created `backend/app/db/models.py` with a `Base` declarative class and five entities matching `database-design.md`'s baseline: `User`, `Project`, `ProjectMember`, `Task`, and `Comment`, plus `TaskStatus` and `TaskPriority` enums.
+
+Timestamp design decision: `created_at`/`updated_at` use `server_default=func.now()` (database-generated) rather than a Python-side default like `datetime.utcnow`. Reasoning: the database is the single authoritative time source, immune to clock skew across multiple application server instances (relevant given the architecture's Cloud Run autoscaling), and works correctly even for rows inserted outside the ORM (raw SQL, migrations, other tools).
+
+Relationship design decisions, made deliberately rather than by default:
+- `User` <-> `Project` (owner): bidirectional relationship with `back_populates` on both sides (`User.owned_projects`, `Project.owner`) - needed because SQLAlchemy requires `back_populates` on both attributes to recognize them as the same relationship and keep them synchronized in memory; without it, calling `project.owner = user` would not automatically update `user.owned_projects`, risking an inconsistent in-memory object graph until reloaded from the database.
+- `Project` -> `Task`: `cascade="all, delete-orphan"` - a task has no meaning without its parent project (matches the ER diagram's "contains" relationship), so deleting a project should delete its tasks. Deliberately NOT applying this pattern to `User` -> `Project`, since a project is a durable business entity that should survive its owner's deletion (ownership can be reassigned; other users may depend on the project's continued existence).
+- `ProjectMember.project` / `ProjectMember.user`: unidirectional relationships only (no `back_populates`, no reverse collections on `User`/`Project`) - a deliberate scope decision for this module, not an oversight. Flagged as a known gap: `User`/`Project` currently have no direct `.memberships` collection, which will need either a proper `back_populates` relationship or explicit queries through `ProjectMember` once membership-listing features are built (likely Module 07).
+- `Task.assignee_id` and `Comment` (`task_id`, `author_id`): bare foreign key columns with no `relationship()` objects. Deliberate YAGNI decision - no current feature needs to navigate from `Task` to its assignee's full `User` object or from `Comment` to its `Task`/author as Python objects; adding `relationship()` now would be unused complexity. Will add if/when a real feature (e.g. returning assignee details in an API response) needs it.
+- `Comment` has no `updated_at`, only `created_at` - treating comments as append-only/immutable for now, consistent with there being no comment-editing feature in the current design scope. Trivial to add later via a new migration if that changes.
+
+All three quality gates pass cleanly against the new models: `ruff check .`, `ruff format --check .`, and `mypy app` (15 source files, no issues). Also caught and fixed a pre-existing, previously unformatted file from Module 05 (`app/core/request_id.py`) during this same formatting pass.
+
+**Step 4 - Alembic initialization**
+
+Added `alembic==1.14.1` as a real runtime dependency (not a dev extra) in `backend/pyproject.toml`, since migrations need to run in production too (matching `docs/architecture.md`'s dedicated `workboard-migrate` Cloud Run job). Rebuilt the backend image to install it.
+
+Ran `alembic init migrations`, generating `backend/alembic.ini` and `backend/migrations/` (`env.py`, `script.py.mako`, `versions/`).
+
+Configured `backend/migrations/env.py` with two required changes:
+1. `target_metadata = Base.metadata` (imported from `app.db.models`) instead of `None` - this is what lets `alembic revision --autogenerate` compare the actual database against the five models built in Step 3.
+2. Both `run_migrations_offline()` and `run_migrations_online()` now call `config.set_main_option("sqlalchemy.url", get_settings().database_url)` before the URL is used, overriding whatever is in `alembic.ini` with the real, typed settings value - consistent with how `app/db/session.py` already resolves the database URL, and satisfying the module's explicit requirement that "the database URL should come from settings/environment rather than a committed credential."
+
+Confirmed `backend/alembic.ini`'s stock `sqlalchemy.url` placeholder (`driver://user:pass@localhost/dbname`) is Alembic's generic template text, never a real credential, and is now fully overridden at runtime regardless - left in place as an intentional, obviously-fake placeholder rather than removed, since its presence makes clear no real value lives there.
+
+**Autogenerate review — a real gap caught before it broke Step 5**
+
+Generated the initial migration: `docker compose run --rm backend alembic revision --autogenerate -m "initial workboard schema"`. Autogenerate correctly detected all five tables in FK-dependency-safe creation order (`users` -> `projects` -> `project_members` -> `tasks` -> `comments`), with correct indexes, nullability, and the composite primary key on `project_members`.
+
+Caught a real, well-documented Alembic/PostgreSQL gap before running the lifecycle: SQLAlchemy's `Enum` type creates a native PostgreSQL `ENUM` type (`taskstatus`, `taskpriority`) as a side effect of table creation in `upgrade()`, but Alembic's autogenerate does not emit a matching type-drop in `downgrade()` - it only drops tables and indexes. Left as generated, this would have caused `alembic downgrade base` to leave both enum types behind, and the immediately following `alembic upgrade head` (required by Step 5's lifecycle exercise) would have failed with `type "taskstatus" already exists`.
+
+Fix: added explicit cleanup at the end of `downgrade()`, after all table drops:
+```python
+sa.Enum(name="taskstatus").drop(op.get_bind(), checkfirst=True)
+sa.Enum(name="taskpriority").drop(op.get_bind(), checkfirst=True)
+```
+
+This directly demonstrates the module's own warning that "autogeneration proposes a migration; it does not understand business intent" and that a human must review "types... and downgrade safety" before trusting generated output - `upgrade()` needed no changes (table creation with its enum side effect worked correctly on the first pass), but `downgrade()` required a manual addition autogenerate simply doesn't know to produce.
+
+**Step 5 - full migration lifecycle**
+
+Ran the complete lifecycle against the real PostgreSQL database:
+
+| Command | Result |
+|---|---|
+| `alembic upgrade head` | `Running upgrade -> 27edc82c2b1b, initial workboard schema` |
+| `alembic current` | `27edc82c2b1b (head)` |
+| `alembic history --verbose` | Single revision, parent `<base>`, full metadata shown |
+| `alembic downgrade base` | `Running downgrade 27edc82c2b1b -> <base>` - succeeded, including the enum type cleanup |
+| `alembic upgrade head` (second time) | Succeeded cleanly - this is the exact step that would have failed with `type "taskstatus" already exists` without the earlier `downgrade()` fix, so this is direct empirical proof the fix was necessary, not just theoretically correct |
+| `alembic check` | `No new upgrade operations detected` - no drift between models and database |
+| `psql \dt` | All 6 tables present: `alembic_version`, `comments`, `project_members`, `projects`, `tasks`, `users` |
+
+This satisfies three validation checklist items directly: an empty PostgreSQL database reaches head using migrations only, the latest revision can be downgraded and reapplied safely in training, and `alembic check` reports no model drift.
+
+**Step 6 - one incremental migration**
+
+Added a composite index to `backend/app/db/models.py`'s `Task` class: `__table_args__ = (Index("ix_tasks_project_id_status", "project_id", "status"),)` - chosen deliberately over relying solely on the existing single-column `project_id` index, since a query filtering on both `project_id` and `status` together (e.g. "backlog tasks in project X") benefits from an index ordered by both columns: PostgreSQL can jump directly to matching entries rather than finding all rows for a project first and then filtering status afterward on each one. With a large project (e.g. 10,000 tasks, 500 backlog), this meaningfully reduces the amount of data scanned versus using the single-column index alone.
+
+Generated the migration as a genuinely new revision (not editing the applied initial migration, per the module's explicit warning): `docker compose run --rm backend alembic revision --autogenerate -m "add project_id status index on tasks"` -> correctly chained to the initial migration via `down_revision`, and correctly detected only the new index with no unrelated changes. Reviewed `upgrade()`/`downgrade()` - both clean mirror images, no equivalent gap to the earlier enum-cleanup issue since index creation/removal is inherently symmetric.
+
+Full lifecycle verified against the real database, including direct `psql` inspection at each step (not just trusting Alembic's own success messages):
+
+| Step | Result |
+|---|---|
+| `alembic upgrade head` | `27edc82c2b1b -> 4840454901bd` |
+| `alembic check` | `No new upgrade operations detected` |
+| `psql \d tasks` | `ix_tasks_project_id_status` present alongside the pre-existing `ix_tasks_project_id` |
+| `alembic downgrade -1` | `4840454901bd -> 27edc82c2b1b` |
+| `psql \d tasks` | Composite index gone, single-column index still present - confirms downgrade removed exactly and only what it added |
+| `alembic upgrade head` (reapply) | Clean, `27edc82c2b1b -> 4840454901bd` again |
+| `alembic check` | `No new upgrade operations detected` - final state matches models exactly |
+
+**Step 7 - transaction atomicity test**
+
+Created `backend/app/services/projects.py`, establishing the `services/` layer (matching `docs/architecture.md`'s Router -> Schema -> Dependency -> Service -> Repository -> Model layering from Module 00). `create_project_with_owner(db, name, slug, owner_id, simulate_failure)` creates a `Project`, flushes it (populating `project.id` without committing), then either raises a deliberate `RuntimeError` (`simulate_failure=True`) before creating the `ProjectMember` row, or creates the membership normally.
+
+Key concept verified: `db.flush()` sends INSERT statements to PostgreSQL within the current transaction, making them visible to that transaction, but they remain impermanent until `db.commit()`. If an exception is raised after `flush()` but before `commit()`, a subsequent `rollback()` discards everything the transaction did, including already-flushed inserts - this is why raising mid-function, before any explicit commit, is sufficient to guarantee atomicity, without needing to manually track or undo the first insert.
+
+Created `backend/tests/test_transactions.py`, run against the REAL PostgreSQL database (not SQLite) via `docker compose run`, per the module's explicit warning that "assuming SQLite proves PostgreSQL behavior" is a common failure mode - transaction semantics need to be tested against the actual database engine being used in production.
+
+Two tests, both passing:
+- `test_failure_rolls_back_both_inserts`: calls `create_project_with_owner` with `simulate_failure=True`, catches the expected `RuntimeError`, rolls back, then queries the database directly and confirms neither the `Project` row nor the `ProjectMember` row exists.
+- `test_success_commits_both_inserts`: calls the same function with `simulate_failure=False`, confirms both rows exist with correct data (including the membership's `role="owner"`), proving the normal success path still works correctly using the identical code path as the failure test - not a special test-only implementation.
+
+Result: `docker compose run --rm backend pytest tests/test_transactions.py -v` -> `2 passed in 1.84s`. This is direct, empirical proof of atomicity, not inference from code review - satisfying the validation checklist item "project plus owner membership is atomic under an injected failure."
+
+**Step 8 - inspecting generated SQL and N+1 detection**
+
+Enabled SQLAlchemy's SQL echo (`logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)`) to observe actual generated SQL. Two findings:
+
+1. Bulk insert optimization: creating multiple `Task` rows in a loop (`db.add(Task(...))` x3) resulted in a single batched `INSERT INTO tasks` using SQLAlchemy's `insertmanyvalues` optimization, not three separate `INSERT` statements - confirmed by counting the actual SQL statements in the echo output.
+
+2. N+1 query pattern, demonstrated as a scaling problem rather than just a mechanism: with 3 projects each having tasks, accessing `p.tasks` inside a for loop (`Project.tasks` is a default lazy-loaded relationship, no eager-loading configured) triggered 1 query for the projects plus 3 separate queries for tasks (one per project) = 4 total queries for 3 projects. Confirmed the pattern scales linearly: N projects touched -> 1 + N queries.
+
+Fix demonstrated: the same query rewritten with `.options(selectinload(Project.tasks))` produced exactly 2 queries total regardless of N - one for projects, one batched `SELECT ... WHERE tasks.project_id IN (...)` fetching all matching tasks for all projects in a single round trip.
+
+| Approach | Queries for 3 projects | Queries for N projects |
+|---|---|---|
+| Lazy load (`p.tasks` in a loop) | 4 (1 + 3) | 1 + N |
+| `selectinload(Project.tasks)` | 2 | 2 (constant) |
+
+This is a concrete case for why relationship loading strategy matters once real list-view features are built (Module 07's project/task listing) - the default lazy behavior is fine for single-object access but becomes a real performance problem the moment a route needs to return a list of projects each with their tasks.
+
+Bonus verification: cleaned up test data with a real commit (not rollback), which also empirically confirmed the `cascade="all, delete-orphan"` design decision from Step 3 actually works - deleting the 3 test projects correctly cascade-deleted their 6 associated tasks without needing to delete them explicitly.
+
+**Independent challenge - EXPLAIN evidence for the (project_id, status) index**
+
+Generated 8000 test tasks across two projects (target project id 7, ~2667 tasks) with randomly assigned status values, to give PostgreSQL's query planner enough data for a meaningful before/after comparison - a tiny table would likely favor a sequential scan regardless of index presence, since scanning a handful of rows is cheaper than using an index.
+
+Ran `EXPLAIN (ANALYZE, BUFFERS)` for the same query (`WHERE project_id = 7 AND status = 'BACKLOG'`) with the composite index dropped, then restored:
+
+Note: caught and corrected a data issue mid-exercise - SQLAlchemy's `Enum` type stores the Python enum member's `.name` (e.g. `"BACKLOG"`) in PostgreSQL by default, not its `.value` (`"backlog"`), so the query needed to match the stored uppercase form.
+
+Before (single-column `ix_tasks_project_id` only):
+- `Bitmap Index Scan` on `ix_tasks_project_id` finds all 2667 rows for `project_id = 7`, then a `Filter` step discards 1737 of them post-scan to match `status = 'BACKLOG'`.
+- Execution Time: 1.789 ms
+
+After (composite `ix_tasks_project_id_status` restored):
+- `Bitmap Index Scan` on `ix_tasks_project_id_status` uses `Index Cond: ((project_id = 7) AND (status = 'BACKLOG'))` - both conditions are satisfied directly by the index, fetching only the ~930 matching rows.
+- `Rows Removed by Filter: 1737` disappears entirely - no post-scan filtering needed.
+- Execution Time: 1.050 ms (~41% faster on this dataset)
+
+Write/storage cost discussion: the composite index adds overhead on every INSERT/UPDATE/DELETE to `tasks` (the index must be maintained alongside the data), and consumes additional disk space proportional to table size. This tradeoff is worthwhile here because task listing/filtering by project and status is a core, frequent read pattern for this application (matches the actual Workboard UI's task board view), while task writes are comparatively infrequent - the read-heavy access pattern justifies the write-side index-maintenance cost.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - SQLAlchemy entity design with correct constraints/relationships, one-to-many and many-to-many patterns, back_populates, cascade/delete-orphan, request-scoped sessions with commit/rollback, the full Alembic migration lifecycle (autogenerate, upgrade, downgrade, incremental revisions), transaction atomicity via flush/commit/rollback, and SQL inspection including N+1 detection and index justification via EXPLAIN.
+- I can explain it without the reference code: yes - the layer-placement principle (Pydantic for shape/format, service for business workflow rules, database for integrity constraints, frontend for UX only); cascade behavior should represent genuine ownership (a task has no meaning without its project, but a project outlives its owner); the N+1 problem occurs when accessing a lazy-loaded relationship in a loop triggers one query per iteration instead of one batched eager-loaded query.
+- I can diagnose one failure in this area: mostly yes - comfortable reasoning about rule placement, relationship design, composite keys, why migrations should be additive not edited in place, why downgrade must fully undo upgrade (including non-obvious side effects like enum types), transaction behavior, and index design. Would be slower on complex Alembic merge conflicts, advanced PostgreSQL performance tuning, and unusual ORM mapping edge cases.
+- Confidence from 1-5: 4/5 - can explain concepts, justify design decisions, and solve similar problems with moderate independence. A 5 would mean independently designing schemas, anticipating rollback issues, and optimizing query loading strategies without guidance at production scale - not quite there yet, but the gap is mainly experience with larger systems, not conceptual understanding.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
