@@ -1221,6 +1221,19 @@ This is genuine proof the test suite catches real regressions, not just proof th
 
 Restored the correct `ALLOWED_TRANSITIONS` dict, confirmed the file matches the original exactly, then ran the FULL test suite (not just the two affected files) to verify the complete codebase: `docker compose run --rm backend pytest -v` -> `30 passed, 1 warning in 5.67s` across all 7 test files (`test_api`, `test_health`, `test_projects_api`, `test_request_id`, `test_task_transitions`, `test_tasks_api`, `test_transactions`) - confirming everything built across Modules 05, 06, and 07 works together correctly, not just the newly-added pieces in isolation.
 
+**Step 9 - reviewing query and transaction behavior**
+
+Applied the SQL-echo inspection habit from Module 06 to the real project/task routes, testing whether the theoretical N+1 analysis holds empirically rather than just trusting the reasoning.
+
+Predicted first (before running): `list_projects` and `list_tasks` should be N+1-safe, since `ProjectRead` and `TaskRead` are flat DTOs with no nested relationship fields (no `owner: UserRead`, no `tasks: list[TaskRead]`) - constructing them only reads scalar columns already present on the originally-queried row, never touching a lazy-loaded relationship like `.owner` or `.tasks`.
+
+Confirmed empirically via SQL echo:
+- `list_projects_visible_to_user` + `ProjectRead.model_validate(p)` for 2 projects -> exactly 1 query total, zero additional queries during DTO construction.
+- `list_tasks_for_project` + `TaskRead.model_validate(t)` for 2 tasks -> exactly 1 query total, zero additional queries during DTO construction.
+- `get_project_task_counts` -> confirmed exactly 2 separate `COUNT` queries (total, then completed `WHERE status='DONE'`), empirically matching the design note already flagged in Step 2 as a known, deliberate-but-unoptimized pattern - not fixed now, same reasoning as before (functionally correct, a genuine but low-priority consolidation opportunity).
+
+Total: 4 queries across all three operations tested, no relationship lazy-loading anywhere. This is a genuine, positive verification result (the design held up under scrutiny), not a bug find - equally valuable to document as the bugs found elsewhere in this module, since it confirms the schema design decision from Step 1 (explicitly flat, no nested relationship data in `ProjectRead`/`TaskRead`) structurally prevents the exact N+1 pattern demonstrated as a real problem in Module 06.
+
 ---
 
 ## Module entry template
