@@ -1044,6 +1044,13 @@ After (composite `ix_tasks_project_id_status` restored):
 
 Write/storage cost discussion: the composite index adds overhead on every INSERT/UPDATE/DELETE to `tasks` (the index must be maintained alongside the data), and consumes additional disk space proportional to table size. This tradeoff is worthwhile here because task listing/filtering by project and status is a core, frequent read pattern for this application (matches the actual Workboard UI's task board view), while task writes are comparatively infrequent - the read-heavy access pattern justifies the write-side index-maintenance cost.
 
+**Self-rating**
+
+- I can repeat this with notes: yes - SQLAlchemy entity design with correct constraints/relationships, one-to-many and many-to-many patterns, back_populates, cascade/delete-orphan, request-scoped sessions with commit/rollback, the full Alembic migration lifecycle (autogenerate, upgrade, downgrade, incremental revisions), transaction atomicity via flush/commit/rollback, and SQL inspection including N+1 detection and index justification via EXPLAIN.
+- I can explain it without the reference code: yes - the layer-placement principle (Pydantic for shape/format, service for business workflow rules, database for integrity constraints, frontend for UX only); cascade behavior should represent genuine ownership (a task has no meaning without its project, but a project outlives its owner); the N+1 problem occurs when accessing a lazy-loaded relationship in a loop triggers one query per iteration instead of one batched eager-loaded query.
+- I can diagnose one failure in this area: mostly yes - comfortable reasoning about rule placement, relationship design, composite keys, why migrations should be additive not edited in place, why downgrade must fully undo upgrade (including non-obvious side effects like enum types), transaction behavior, and index design. Would be slower on complex Alembic merge conflicts, advanced PostgreSQL performance tuning, and unusual ORM mapping edge cases.
+- Confidence from 1-5: 4/5 - can explain concepts, justify design decisions, and solve similar problems with moderate independence. A 5 would mean independently designing schemas, anticipating rollback issues, and optimizing query loading strategies without guidance at production scale - not quite there yet, but the gap is mainly experience with larger systems, not conceptual understanding.
+
 ---
 
 ## Module entry template
