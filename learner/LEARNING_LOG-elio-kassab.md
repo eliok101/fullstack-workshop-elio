@@ -1006,6 +1006,25 @@ Two tests, both passing:
 
 Result: `docker compose run --rm backend pytest tests/test_transactions.py -v` -> `2 passed in 1.84s`. This is direct, empirical proof of atomicity, not inference from code review - satisfying the validation checklist item "project plus owner membership is atomic under an injected failure."
 
+**Step 8 - inspecting generated SQL and N+1 detection**
+
+Enabled SQLAlchemy's SQL echo (`logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)`) to observe actual generated SQL. Two findings:
+
+1. Bulk insert optimization: creating multiple `Task` rows in a loop (`db.add(Task(...))` x3) resulted in a single batched `INSERT INTO tasks` using SQLAlchemy's `insertmanyvalues` optimization, not three separate `INSERT` statements - confirmed by counting the actual SQL statements in the echo output.
+
+2. N+1 query pattern, demonstrated as a scaling problem rather than just a mechanism: with 3 projects each having tasks, accessing `p.tasks` inside a for loop (`Project.tasks` is a default lazy-loaded relationship, no eager-loading configured) triggered 1 query for the projects plus 3 separate queries for tasks (one per project) = 4 total queries for 3 projects. Confirmed the pattern scales linearly: N projects touched -> 1 + N queries.
+
+Fix demonstrated: the same query rewritten with `.options(selectinload(Project.tasks))` produced exactly 2 queries total regardless of N - one for projects, one batched `SELECT ... WHERE tasks.project_id IN (...)` fetching all matching tasks for all projects in a single round trip.
+
+| Approach | Queries for 3 projects | Queries for N projects |
+|---|---|---|
+| Lazy load (`p.tasks` in a loop) | 4 (1 + 3) | 1 + N |
+| `selectinload(Project.tasks)` | 2 | 2 (constant) |
+
+This is a concrete case for why relationship loading strategy matters once real list-view features are built (Module 07's project/task listing) - the default lazy behavior is fine for single-object access but becomes a real performance problem the moment a route needs to return a list of projects each with their tasks.
+
+Bonus verification: cleaned up test data with a real commit (not rollback), which also empirically confirmed the `cascade="all, delete-orphan"` design decision from Step 3 actually works - deleting the 3 test projects correctly cascade-deleted their 6 associated tasks without needing to delete them explicitly.
+
 ---
 
 ## Module entry template
