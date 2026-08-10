@@ -1411,6 +1411,32 @@ Findings:
 
 Confirmed cleanup: removed the temporary debug route, verified via curl it returns 404, and confirmed `git status`/`diff` show no trace of the crash-test route in the committed code.
 
+**Step 8 - security tests**
+
+Created `backend/tests/test_auth_security.py`, automating the key security properties verified manually throughout this module: token type discrimination (refresh rejected as access and vice versa), protected routes rejecting missing/garbage auth, full register-login-access-protected-route flow (also asserting `password_hash` never appears in the register response), wrong-password and nonexistent-email login attempts returning byte-for-byte identical error responses (automating the timing-safety design from Step 3), duplicate registration returning 409, and both CORS preflight cases (disallowed origin gets no `Access-Control-Allow-Origin` header, allowed origin gets the correct one) - automating the Step 6 findings permanently rather than relying on manual curl checks going forward.
+
+`9 passed, 1 warning in 6.79s` (`docker compose run --rm backend pytest tests/test_auth_security.py -v`).
+
+Real regression caught by running the full suite, not just the new file: `test_projects_api.py` and `test_tasks_api.py` (Module 07) still imported `FAKE_CURRENT_USER_ID`, which no longer exists after this module's earlier retirement of that placeholder - breaking test collection entirely (`2 errors during collection`, not a test failure but a hard import error). Fixed by rewriting both files' fixtures to register and log in a real, unique test user per test run (via the actual `/auth/register`/`/auth/login` endpoints) and pass a genuine Bearer token on every call that now requires authentication, instead of relying on a hardcoded fake user id.
+
+Full suite reverified after the fix: `43 passed, 1 warning in 15.42s` (up from 34 after Module 07 - 9 new security tests) - confirming all prior work (health, status, echo, request-id, projects, tasks, transactions, task transitions, and now auth security) still passes together.
+
+**Independent challenge - refresh-token rotation and revocation (design-only ADR)**
+
+Per the module's own stated allowance ("A design-only ADR is acceptable if implementation is out of cohort scope"), authored a design-only ADR rather than implementing it, given the scope of a full implementation (new table, migration, concurrency-safe rotation logic, and a real concurrency test) versus the module's remaining time budget.
+
+Placement decision: the task originally specified `docs/adr/0001-...`, but this repo already has an established, populated ADR location - `docs/decision-records/`, referenced directly in `CLAUDE.md` and containing five existing ADRs (`001`-`005`), including `005-jwt-access-and-cookie-refresh.md`, the exact prior decision this new one extends (it documents the current baseline's refresh-cookie design and explicitly lists "refresh tokens lack rotation, revocation, reuse detection" as a known negative consequence). Creating a separate `docs/adr/` directory would have fragmented where architectural decisions live in this repo for no benefit. Placed the new document at `docs/decision-records/006-refresh-token-rotation-and-revocation.md` instead, matching the existing numbering/naming convention, and cross-referenced ADR 005 and ADR 006 to each other.
+
+Design covers, deliberately reusing patterns already established and proven elsewhere in this workshop:
+- Data model: a new `refresh_sessions` table storing a HASHED token identifier (never the raw token - same never-store-recoverable-secrets principle as Argon2 password hashing from Step 1), with `issued_at`/`expires_at`/`revoked_at`/`replaced_by_id` forming a traceable rotation chain.
+- Rotation: single-use refresh tokens - each successful refresh revokes the current session row and issues a new one, linked via `replaced_by_id`.
+- Reuse detection: presenting an already-revoked token is treated as evidence of compromise (not assumed to be a benign retry), triggering full-chain revocation and a generic 401 - consistent with Step 7's frontend-safe error principle of never explaining the specific reason for a security-relevant rejection.
+- Concurrency: explicitly identifies the need for row-level locking (`SELECT ... FOR UPDATE`) around the check-then-revoke-then-create sequence, to prevent two simultaneous requests with the same valid token both succeeding - directly reusing the transaction-atomicity discipline proven in Module 06's empirical atomicity tests.
+- Logout: would actually revoke the session server-side, closing the gap identified in Step 9 where the current baseline's logout only clears a client-side cookie with no server-side effect.
+- Distinguishes single-session revocation (automatic, triggered by reuse detection) from full-account revocation (a separate, heavier action for account-recovery scenarios).
+- Named the test cases a real implementation would require, without writing them: single-use enforcement, reuse-triggers-full-chain-revocation, genuine concurrent-request safety (not just sequential calls), logout's server-side effect, and database-level expiry enforcement independent of the JWT's own `exp` claim.
+- Consequences section honestly notes what this design does NOT solve (a stolen access token remains valid until its own short natural expiry - this ADR only addresses the refresh-token layer) and the accepted tradeoff of treating any reuse as compromise (favoring security over convenience, with a possible future refinement).
+
 **Step 9 - threat notes**
 
 An honest catalog of what this authentication implementation protects against, what it explicitly does not, and why - per `docs/security.md`'s framing that Workboard is "an educational reference" that "demonstrates baseline controls" without production-level hardening.
