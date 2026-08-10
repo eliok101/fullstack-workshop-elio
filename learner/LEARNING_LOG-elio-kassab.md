@@ -1404,6 +1404,7 @@ Real gaps found and fixed this module (empirically verified, not hypothetical):
 1. Login timing side-channel: originally, `verify_password` only ran when a matching user existed, meaning response timing alone could reveal whether an email was registered even with an identical error message. Fixed by always running the deliberately-slow Argon2 verification against a dummy hash when no user matches, then rigorously confirmed via 20-iteration statistical timing comparison that the fix closes the gap (6.18ms mean difference against ~40ms standard deviation - statistically indistinguishable from noise).
 2. Registration race condition (TOCTOU): the email-uniqueness pre-check alone would have let two concurrent registrations for the same email both pass, with the second failing as an unhandled 500 instead of a clean 409 under real concurrent load. Fixed by catching the database's own `IntegrityError` as the authoritative guarantee, the same pattern already established for project slugs in Module 06/07.
 3. Investigated (not a gap): a 401-vs-404 status code difference based on authentication state for `GET /projects/{id}`. Confirmed empirically this does not leak resource existence, since the 401 fires identically for any project ID before the route logic runs at all - the harder case (an authenticated stranger comparing a real private project against a genuinely nonexistent one) returns byte-for-byte identical 404 responses, confirming Module 07's resource-scoped design holds under real multi-user conditions.
+4. Confirmed (not a gap): CORS is correctly configured and empirically verified to reject disallowed origins - `Access-Control-Allow-Origin` is entirely absent from preflight responses for an unrecognized `Origin`, with a 400 status. Also explicitly confirmed via design discussion that CORS is not and cannot be an authorization mechanism - it only restricts browser JavaScript, never non-browser clients like curl or scripts, so server-side authentication/authorization remains the only real enforcement boundary regardless of CORS configuration.
 
 Explicitly out of scope for this baseline (per the module's own stated boundary), with concrete impact if exploited:
 
@@ -1415,7 +1416,7 @@ Explicitly out of scope for this baseline (per the module's own stated boundary)
 
 4. Access tokens cannot be revoked before natural expiration. Logout only clears the refresh cookie; an already-issued access token remains valid until it expires on its own (currently `access_token_expire_minutes`), even if the user "logs out" or an admin wants to force a session to end immediately.
 
-5. CORS/cookie configuration reviewed in Step 6 is tuned for this training environment's same-site local setup - `docs/security.md` explicitly flags that cross-site custom-domain production deployments need separate review of cookie domain, `SameSite`, and TLS termination, not assumed to already be handled here.
+5. This module's CORS configuration is tuned for a same-site local training environment (frontend and backend on localhost, different ports). `docs/security.md` explicitly flags that cross-site custom-domain production deployments need separate review of cookie domain, `SameSite` attribute, and TLS termination - not assumed to already be handled by this training baseline.
 
 ---
 
