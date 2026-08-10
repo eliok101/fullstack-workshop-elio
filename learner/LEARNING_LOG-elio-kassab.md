@@ -1396,6 +1396,21 @@ Confirmed the real answer via the complete, unabridged response headers: `400 Ba
 
 Then ran the same preflight against the ALLOWED origin (`http://localhost:3000`) and confirmed `Access-Control-Allow-Origin: http://localhost:3000` IS present in that response, alongside `allow-credentials: true` and the full allowed methods/headers list - the middleware correctly differentiates based on the actual `Origin` header sent.
 
+**Step 7 - frontend-safe error behavior**
+
+Design discussion before testing: reasoned through why leaking a stack trace from an authentication endpoint specifically is worse than from a simple endpoint like `/health/live`. A traceback from an auth route can reveal reconnaissance-valuable internals - the password hashing library in use, JWT validation flow, database model structure, internal file paths, and exception-handling logic - none of which are direct exploits by themselves, but which meaningfully help an attacker understand and target the authentication system more precisely. The correct principle: log the full exception server-side, return only a generic message to the client - the same "don't reveal internal detail in the client-facing message" discipline already established for `verify_password` (Step 1) and `_check_readiness` (Module 05).
+
+Verified empirically rather than assumed, using a deliberately added, temporary debug route that raised `RuntimeError("...db_password=hunter2")` - a fake secret embedded specifically to trace where the boundary between server-log and client-response actually falls.
+
+Findings:
+1. Client-facing response: curl showed a clean, generic `500 Internal Server Error` with plain-text body `"Internal Server Error"` - no traceback, no exception message, no file paths, and critically, the embedded fake secret (`db_password=hunter2`) never appeared anywhere in the HTTP response.
+2. Server-side logs: `docker compose logs backend` showed the COMPLETE traceback, including exact file paths, line numbers, and the full exception message with the fake secret intact - confirming an operator with legitimate log access retains everything needed to diagnose a real failure.
+3. Confirmed the correct disclosure boundary is already in place for genuinely unhandled exceptions, without needing any additional handler - FastAPI/Starlette's default unhandled-exception behavior already achieves the log/response split this step is asking for, since debug mode is not enabled anywhere (confirmed no `debug=True` in `main.py`, and the Dockerfile's `--reload` flag only affects code-reload behavior, not error verbosity).
+4. Important refinement beyond the mechanical test: the real discipline is not "the client/log split will protect me" as a safety net - it's "never interpolate secrets into exception messages in the first place." The test intentionally embedded a fake secret to prove the boundary holds, but a properly written codebase should never rely on that boundary catching a real secret that shouldn't have been placed in exception text to begin with. This is now noted as a coding discipline, not just a response-shape check.
+5. Bonus finding, connecting back to Step 3's request-ID middleware (Module 05): the crash traceback showed the exception propagating directly through `RequestIDMiddleware`'s `dispatch` method at the `call_next(request)` line - confirming that when a route raises before returning normally, the middleware never reaches the line that attaches `X-Request-ID` to the response. This means a genuinely crashed request's error response currently lacks a request ID, which would make correlating a specific failed request to its log entry harder in production - a real, minor gap worth noting, though out of scope to fix as part of this security-focused module.
+
+Confirmed cleanup: removed the temporary debug route, verified via curl it returns 404, and confirmed `git status`/`diff` show no trace of the crash-test route in the committed code.
+
 **Step 9 - threat notes**
 
 An honest catalog of what this authentication implementation protects against, what it explicitly does not, and why - per `docs/security.md`'s framing that Workboard is "an educational reference" that "demonstrates baseline controls" without production-level hardening.
