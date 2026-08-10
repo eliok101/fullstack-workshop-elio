@@ -1288,6 +1288,22 @@ Verified all four properties empirically:
 3. Malformed/non-Argon2 hash -> raises `InvalidHashError`, a genuinely distinct exception, confirming it is NOT silently swallowed by the narrow `except` clause.
 4. Hashing the identical password twice produces two different hash strings, confirming Argon2's per-hash random salt is working (this is also why two users with the same password never have identical database rows).
 
+**Step 2 - token claims and type discrimination**
+
+Design discussion before writing code: reasoned through why signature verification must happen BEFORE checking the `token_type` claim, not after. Until a JWT's signature is verified, every claim in its payload (including `token_type`) is untrusted, attacker-controllable data - checking type first would mean making a security decision based on forgeable input. The correct order is: verify signature and expiration first (establishing the payload can be trusted), then inspect claims like `token_type`. This generalizes to a broader principle: never make authorization decisions from untrusted data before authentication has established trust.
+
+Created `backend/app/core/tokens.py`: `create_access_token`, `create_refresh_token`, and `decode_token(token, expected_type)`. Each token carries `sub` (user id), `type` (access/refresh, via a `TokenType` `StrEnum`), `iat`, and `exp`. `decode_token` verifies signature/expiration via PyJWT first, THEN explicitly checks `payload.get("type") == expected_type.value`, raising a custom `InvalidTokenError` on any failure (bad signature, expired, wrong type, or missing/invalid subject).
+
+Deliberate security choice confirmed: the signing algorithm (HS256) is hardcoded in `decode_token`, not read from settings or trusted from the token's own header - this prevents algorithm-confusion attacks, where an attacker crafts a token specifying a different or absent algorithm (e.g. `"alg": "none"`) hoping the server will trust the token's own declaration instead of enforcing one server-side.
+
+Verified empirically with 6 checks, the two most important being the direct proof against Module 08's explicitly named failure mode ("accepting any valid JWT without checking token type"):
+1. Access token create/decode round trip -> correct user id.
+2. Refresh token create/decode round trip -> correct user id.
+3. A genuinely valid, correctly-signed refresh token presented to `decode_token(..., TokenType.ACCESS)` -> correctly rejected with `InvalidTokenError`, proving the cross-type substitution attack designed against is actually blocked in the real implementation, not just theoretically.
+4. The reverse case (access token presented as refresh) -> also correctly rejected.
+5. A tampered signature (corrupted last 5 characters) -> correctly rejected with a signature verification failure.
+6. A garbage, non-JWT string -> correctly rejected with a malformed-token error.
+
 ---
 
 ## Module entry template
