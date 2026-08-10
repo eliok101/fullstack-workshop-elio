@@ -1378,6 +1378,37 @@ Caught and investigated a real nuance in `GET /projects/{project_id}`'s response
 
 Empirically confirmed the design holds up under the harder test: compared an authenticated stranger's request to a genuinely NONEXISTENT project ID (999999999) against the same stranger's request to a real, private, unauthorized project ID (70). Both returned byte-for-byte identical response shapes: 404, `{"detail": "Project <id> not found", "code": "not_found"}` - the only difference being the caller's own input echoed back, not any information about the project. This confirms Module 07's `get_visible_project_or_404` design genuinely closes the enumeration channel for authenticated users, which is the harder and more important case to get right, since an attacker with a valid account (not just an anonymous one) is the more realistic threat model for probing private resource existence.
 
+**Step 6 - CORS configuration**
+
+Confirmed `settings.cors_origins` was already correctly restricted to the exact frontend origin (`http://localhost:3000`, no wildcard) as a carryover from Module 05's original `CORSMiddleware` setup - satisfying "local allowed origin is the exact frontend origin" without needing a code change, but not yet exercised or explained until now.
+
+Sent a real preflight `OPTIONS` request (non-simple: `PATCH` with `Authorization`/`Content-Type` headers, exactly what a real frontend PATCH call would trigger) from the allowed origin: `200 OK`, with `access-control-allow-origin: http://localhost:3000`, `access-control-allow-credentials: true`, `access-control-allow-headers` echoing back what was requested, and `access-control-max-age: 600` (the browser caches the preflight result for 10 minutes, avoiding a repeat preflight on every request).
+
+Sent the same preflight from a disallowed origin (`http://evil-site.example`): `400 Bad Request`, `"Disallowed CORS origin"`, and critically the `access-control-allow-origin` header is absent entirely - this is what makes a real browser refuse to let JS read the response.
+
+Directly demonstrated why CORS is NOT an API authorization layer, per the module's explicit requirement to explain this: sent a real (non-preflight) `GET /api/v1/projects` request with a disallowed `Origin: http://evil-site.example` header but a genuine, valid Bearer token. Result: `200 OK`, full private project data returned - the disallowed `Origin` header did nothing to stop the request, because CORS is enforced by the browser refusing to expose the response to page JavaScript, not by the server refusing to process the request. `curl`, like any non-browser HTTP client (a script, another backend service, an attacker using a tool instead of a browser), simply ignores CORS entirely. The `access-control-allow-origin` header was correctly absent from this response too, confirming a real browser would have blocked script access to it - but the server-side authorization decision was made entirely by the Bearer token, completely independent of CORS. This is the core lesson: CORS protects browsers from malicious pages, not APIs from malicious callers - real authorization must always happen server-side regardless of Origin.
+
+**Step 9 - threat notes**
+
+An honest catalog of what this authentication implementation protects against, what it explicitly does not, and why - per `docs/security.md`'s framing that Workboard is "an educational reference" that "demonstrates baseline controls" without production-level hardening.
+
+Real gaps found and fixed this module (empirically verified, not hypothetical):
+1. Login timing side-channel: originally, `verify_password` only ran when a matching user existed, meaning response timing alone could reveal whether an email was registered even with an identical error message. Fixed by always running the deliberately-slow Argon2 verification against a dummy hash when no user matches, then rigorously confirmed via 20-iteration statistical timing comparison that the fix closes the gap (6.18ms mean difference against ~40ms standard deviation - statistically indistinguishable from noise).
+2. Registration race condition (TOCTOU): the email-uniqueness pre-check alone would have let two concurrent registrations for the same email both pass, with the second failing as an unhandled 500 instead of a clean 409 under real concurrent load. Fixed by catching the database's own `IntegrityError` as the authoritative guarantee, the same pattern already established for project slugs in Module 06/07.
+3. Investigated (not a gap): a 401-vs-404 status code difference based on authentication state for `GET /projects/{id}`. Confirmed empirically this does not leak resource existence, since the 401 fires identically for any project ID before the route logic runs at all - the harder case (an authenticated stranger comparing a real private project against a genuinely nonexistent one) returns byte-for-byte identical 404 responses, confirming Module 07's resource-scoped design holds under real multi-user conditions.
+
+Explicitly out of scope for this baseline (per the module's own stated boundary), with concrete impact if exploited:
+
+1. No refresh-token rotation, reuse detection, or revocation. If a refresh token is stolen (compromised device, XSS, etc.), the attacker can repeatedly call `POST /auth/refresh` to mint new access tokens and act as the victim for the token's full lifetime (currently `refresh_token_expire_days`), with no server-side way to distinguish the attacker's use from the legitimate user's - both can refresh independently and simultaneously, since nothing invalidates a refresh token after use. This is precisely the gap the independent challenge addresses.
+
+2. No account lockout or rate limiting on login attempts. Since timing is now normalized (finding #1 above), the remaining risk is unlimited guess attempts - an attacker can attempt unlimited password guesses against a known email with no throttling or lockout, making online brute-force attacks against weak passwords feasible over a long enough time window.
+
+3. No email verification or password reset flow. A registered email is never confirmed to be owned by the registrant, and there is no self-service account recovery path - both explicitly listed in `docs/security.md`'s pre-production checklist.
+
+4. Access tokens cannot be revoked before natural expiration. Logout only clears the refresh cookie; an already-issued access token remains valid until it expires on its own (currently `access_token_expire_minutes`), even if the user "logs out" or an admin wants to force a session to end immediately.
+
+5. CORS/cookie configuration reviewed in Step 6 is tuned for this training environment's same-site local setup - `docs/security.md` explicitly flags that cross-site custom-domain production deployments need separate review of cookie domain, `SameSite`, and TLS termination, not assumed to already be handled here.
+
 ---
 
 ## Module entry template
