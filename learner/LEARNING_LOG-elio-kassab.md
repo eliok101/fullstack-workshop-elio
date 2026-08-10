@@ -1304,6 +1304,20 @@ Verified empirically with 6 checks, the two most important being the direct proo
 5. A tampered signature (corrupted last 5 characters) -> correctly rejected with a signature verification failure.
 6. A garbage, non-JWT string -> correctly rejected with a malformed-token error.
 
+**Step 3 (part 1) - authentication service, with two real security gaps caught before shipping**
+
+Created `backend/app/repositories/users.py` (`get_user_by_email`, `get_active_user_by_id` with query-level `is_active` filtering - chosen deliberately for consistency with login's information-hiding principle, rather than a two-step load-then-check that could distinguish "inactive" from "nonexistent" internally). Moved `get_user_by_email` out of `projects.py` into this new file, consistent with Module 07's "focused repositories per entity" principle - a User-related function didn't belong bolted onto the Project repository.
+
+Design discussion before writing register/login logic: reasoned through why `authenticate_user`'s failure check must be a single combined condition (`user is None or not verify_password(...)`) raising one identical error, rather than two separate checks with different messages - the earlier resource-scoped-404 principle from Module 03 applied to authentication: revealing "no such account" vs. "wrong password" as distinct outcomes would let an attacker enumerate valid emails.
+
+Created `backend/app/services/auth.py` with `register_user`, `authenticate_user`, `create_token_pair`. Two real, non-obvious security gaps were caught during review, both fixed rather than deferred:
+
+1. Timing side-channel: the initial implementation of `authenticate_user` short-circuited on `user is None`, meaning `verify_password`'s deliberately slow Argon2 computation only ran when a matching user existed. Even with an identical error message and status code, this meant response TIMING alone could reveal whether an email was registered - the "constant-style generic error" requirement was satisfied in message content but not in actual behavior. Fixed by always calling `verify_password` unconditionally, using a fixed dummy hash (computed once at module load) when no user is found, so the expensive Argon2 computation runs on every login attempt regardless of outcome.
+
+2. Registration race condition (TOCTOU): `register_user`'s email-uniqueness pre-check (`get_user_by_email` -> `ConflictError`) is the same "friendlier error" pattern already used for project slugs in Module 06/07, where the database's own unique constraint is the true authoritative guarantee - but unlike the slug-generation code, the initial version didn't catch the `IntegrityError` a genuine race (two concurrent registrations for the same email) would raise, meaning a real race would have surfaced as an unhandled 500 instead of a clean 409. Fixed by wrapping `db.flush()` in a `try/except IntegrityError`, converting it to the same `ConflictError`.
+
+Verified the timing fix rigorously, not just once: a single-sample timing check first showed an ambiguous ~13.8ms gap (9% of the ~150ms base) - rather than declaring success or failure from one measurement, reran as a proper statistical comparison across 20 iterations per path with a discarded warmup call. Result: nonexistent-email mean 179.84ms (stdev 39.52ms) vs. wrong-password mean 173.65ms (stdev 40.16ms) - a 6.18ms mean difference, far smaller than either distribution's ~40ms standard deviation, confirming the difference is statistically indistinguishable from noise. Contrasted against the pre-fix gap, which would have been orders of magnitude larger (sub-millisecond vs. ~150-180ms, since `verify_password` wouldn't have run at all) - the fix demonstrably closes a real, measurable side channel, not just a theoretical one.
+
 ---
 
 ## Module entry template
