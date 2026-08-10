@@ -1318,6 +1318,43 @@ Created `backend/app/services/auth.py` with `register_user`, `authenticate_user`
 
 Verified the timing fix rigorously, not just once: a single-sample timing check first showed an ambiguous ~13.8ms gap (9% of the ~150ms base) - rather than declaring success or failure from one measurement, reran as a proper statistical comparison across 20 iterations per path with a discarded warmup call. Result: nonexistent-email mean 179.84ms (stdev 39.52ms) vs. wrong-password mean 173.65ms (stdev 40.16ms) - a 6.18ms mean difference, far smaller than either distribution's ~40ms standard deviation, confirming the difference is statistically indistinguishable from noise. Contrasted against the pre-fix gap, which would have been orders of magnitude larger (sub-millisecond vs. ~150-180ms, since `verify_password` wouldn't have run at all) - the fix demonstrably closes a real, measurable side channel, not just a theoretical one.
 
+**Step 3 (part 2) and Step 4 - auth routes, current-user dependency, and full live verification**
+
+Created `backend/app/api/deps.py` with `get_current_user`: extracts the bearer token via FastAPI's `OAuth2PasswordBearer` (a single reusable dependency, not per-route manual logic, per the module's explicit requirement), decodes it as an ACCESS token specifically (reusing the type-discrimination from Step 2), and loads the user via `get_active_user_by_id` - both failure paths (bad/expired/wrong-type token, or user not found/inactive) return the identical 401 "Could not validate credentials" with a `WWW-Authenticate: Bearer` header, per OAuth2 convention.
+
+Created `backend/app/api/routes/auth.py` with all five documented endpoints (`register`, `login`, `refresh`, `logout`, `me`), matching `api-contract.md` exactly: login accepts `OAuth2PasswordRequestForm` (form-encoded, not JSON), returns `{access_token, token_type, expires_in}` and sets the refresh token as an `HttpOnly` cookie scoped to `/api/v1/auth`, with `secure=True` gated on `settings.environment == "production"` (not always-on, since local HTTP development needs `secure=False` to work at all - and not always-off, since production over HTTPS needs it enabled).
+
+Real dependency gap caught and fixed mid-build: the app crashed entirely on startup (`RuntimeError: Form data requires "python-multipart" to be installed`) - `OAuth2PasswordRequestForm` needs this separate package, and it had never been added to `pyproject.toml`, same category of miss as `email-validator` earlier in this module. Added `python-multipart==0.0.20`, rebuilt, confirmed healthy.
+
+Caught before shipping: a prefix-duplication risk, since `auth.router` declares `prefix="/auth"` itself - verified `router.py` includes it the same bare way as `projects.router`/`tasks.router` (no additional prefix argument), and confirmed via the actual OpenAPI schema (not assumed) that all five routes resolve to the correct paths (`/api/v1/auth/register`, `/login`, `/refresh`, `/logout`, `/me`) with no doubling or missing segments.
+
+Full live walkthrough, 9 scenarios, all correct:
+1. `POST /auth/register` -> 201, user object (no `password_hash`).
+2. `POST /auth/login` (correct credentials) -> 200, real `access_token` + `Set-Cookie: refresh_token=...; HttpOnly`.
+3. `GET /auth/me` with the real access token -> 200, correct user info.
+4. `POST /auth/refresh` with the cookie -> 200, a genuinely NEW access token (different from the login one).
+5. `POST /auth/logout` -> 200, cookie cleared.
+6. `GET /auth/me` with no Authorization header -> 401.
+7. `GET /auth/me` with a garbage token string -> 401 (decode failure correctly caught).
+8. `POST /auth/login` with the correct email but wrong password -> 401, identical generic message to a nonexistent-email attempt (per Step 3's timing-safe design).
+9. `POST /auth/register` with an already-registered email -> 409 (the pre-check path, not the race-condition `IntegrityError` path, but confirms the pre-check itself works correctly for the non-concurrent case).
+
+Real inconsistency surfaced by the walkthrough, not yet fixed: three distinct 401 response body shapes exist across the auth surface depending on exactly which check fails - `{"detail":"Not authenticated"}` (FastAPI's own `OAuth2PasswordBearer`, no header at all), `{"detail":"Could not validate credentials"}` (`get_current_user`'s explicit `HTTPException`, bad/expired token), and `{"detail":"Invalid email or password","code":"unauthorized"}` (the app's standard `AppError`/`UnauthorizedError` shape, used by login/refresh). Only the third includes the `code` field every other domain error in this API has. Flagged as a real gap to address, not silently accepted as "it returned 401 so it's fine."
+
+This is the first time the complete auth system (hashing, tokens, timing-safe login, race-safe registration, cookie handling, current-user extraction) has been proven working together through real HTTP traffic, rather than each piece verified only in isolation via direct Python calls.
+
+**FAKE_CURRENT_USER_ID formally retired**
+
+Replaced every use of `FAKE_CURRENT_USER_ID` in `backend/app/api/routes/projects.py` and `backend/app/api/routes/tasks.py` with the real `current_user: User = Depends(get_current_user)` dependency, using `current_user.id` everywhere the placeholder used to be. The constant and its comment (pointing back to this log, added during Module 07's Step 7) are now fully removed - the gap it documented is closed.
+
+Verified live, with a freshly registered and logged-in real user:
+- `POST /api/v1/projects` WITH a valid Bearer token -> 201, project created, owned by the real authenticated user.
+- `GET /api/v1/projects` WITH the token -> 200, correctly lists the project.
+- `POST /api/v1/projects` WITHOUT any Authorization header -> 401 (this exact request would have silently succeeded under the old `FAKE_CURRENT_USER_ID` placeholder, since there was no real check to fail).
+- `GET /api/v1/projects` WITHOUT any Authorization header -> 401.
+
+This is the concrete, empirical closure of the scaffolding gap flagged honestly throughout Module 07: project and task routes are now genuinely protected by real authentication, not a hardcoded constant that happened to always succeed.
+
 ---
 
 ## Module entry template

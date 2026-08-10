@@ -3,6 +3,8 @@
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
+from app.db.models import User
 from app.db.session import get_db
 from app.repositories.projects import list_projects_visible_to_user
 from app.schemas.projects import (
@@ -21,12 +23,12 @@ from app.services.projects import (
 
 router = APIRouter(tags=["projects"])
 
-FAKE_CURRENT_USER_ID = 1  # temporary until Module 08 authentication - requires a user with this id to exist (see learning log, Module 07 Step 7)
-
 
 @router.get("/projects", response_model=list[ProjectRead])
-def list_projects(db: Session = Depends(get_db)) -> list[ProjectRead]:
-    projects = list_projects_visible_to_user(db, FAKE_CURRENT_USER_ID)
+def list_projects(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[ProjectRead]:
+    projects = list_projects_visible_to_user(db, current_user.id)
     return [ProjectRead.model_validate(p) for p in projects]
 
 
@@ -34,14 +36,16 @@ def list_projects(db: Session = Depends(get_db)) -> list[ProjectRead]:
     "/projects", response_model=ProjectRead, status_code=status.HTTP_201_CREATED
 )
 def create_project(
-    payload: ProjectCreate, db: Session = Depends(get_db)
+    payload: ProjectCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> ProjectRead:
     project = create_project_with_owner(
         db,
         name=payload.name,
         description=payload.description,
         is_public=payload.is_public,
-        owner_id=FAKE_CURRENT_USER_ID,
+        owner_id=current_user.id,
     )
     return ProjectRead.model_validate(project)
 
@@ -54,22 +58,33 @@ def get_public_project(
 
 
 @router.get("/projects/{project_id}", response_model=ProjectRead)
-def get_project(project_id: int, db: Session = Depends(get_db)) -> ProjectRead:
-    project = get_visible_project_or_404(db, project_id, FAKE_CURRENT_USER_ID)
+def get_project(
+    project_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectRead:
+    project = get_visible_project_or_404(db, project_id, current_user.id)
     return ProjectRead.model_validate(project)
 
 
 @router.patch("/projects/{project_id}", response_model=ProjectRead)
 def patch_project(
-    project_id: int, payload: ProjectUpdate, db: Session = Depends(get_db)
+    project_id: int,
+    payload: ProjectUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> ProjectRead:
-    project = get_visible_project_or_404(db, project_id, FAKE_CURRENT_USER_ID)
+    project = get_visible_project_or_404(db, project_id, current_user.id)
     update_data = payload.model_dump(exclude_unset=True)
-    updated = update_project(db, project, update_data, FAKE_CURRENT_USER_ID)
+    updated = update_project(db, project, update_data, current_user.id)
     return ProjectRead.model_validate(updated)
 
 
 @router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_project(project_id: int, db: Session = Depends(get_db)) -> None:
-    project = get_visible_project_or_404(db, project_id, FAKE_CURRENT_USER_ID)
-    delete_project(db, project, FAKE_CURRENT_USER_ID)
+def remove_project(
+    project_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    project = get_visible_project_or_404(db, project_id, current_user.id)
+    delete_project(db, project, current_user.id)
