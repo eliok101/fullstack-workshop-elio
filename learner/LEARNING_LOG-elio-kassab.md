@@ -1355,6 +1355,29 @@ Verified live, with a freshly registered and logged-in real user:
 
 This is the concrete, empirical closure of the scaffolding gap flagged honestly throughout Module 07: project and task routes are now genuinely protected by real authentication, not a hardcoded constant that happened to always succeed.
 
+**Step 5 - authorization audit**
+
+Reviewed every route against two questions: does it require authentication, and if it operates on a specific resource, does it verify the AUTHENTICATED user (not just "any logged-in user") has the correct relationship to that resource. This mattered specifically because every route was originally built and tested exclusively against `FAKE_CURRENT_USER_ID` - a single, unchanging user - meaning no test or manual check before now could have surfaced a genuine multi-user authorization gap.
+
+Full route inventory reviewed:
+
+| Route | Auth required | Resource-level check |
+|---|---|---|
+| `POST /auth/register`, `/login` | No (by design) | N/A |
+| `POST /auth/refresh`, `/logout` | Cookie-based, not Bearer | N/A |
+| `GET /auth/me` | Yes | Returns only the caller's own identity |
+| `GET /projects/public/{slug}` | No (by design) | `is_public` check in service layer |
+| `GET`/`POST /projects`, `GET`/`PATCH`/`DELETE /projects/{id}` | Yes | Visibility (list/get) or ownership (patch/delete) |
+| `GET`/`POST /projects/{id}/tasks`, `GET`/`PATCH`/`DELETE .../tasks/{id}` | Yes | Visibility (owner OR member) for all task operations |
+
+Confirmed by design, not oversight: task operations (create/update/delete) are visibility-gated (owner OR member), not ownership-gated - this is the exact policy decided and justified in Module 07. In a genuine multi-user scenario, this means a project MEMBER (not just the owner) can edit or delete another member's tasks. This surprised no one on paper before, since `FAKE_CURRENT_USER_ID` meant "member" and "owner" were always the same single user - now that real distinct users exist, this design consequence is real and worth being deliberate about, but it is not a bug; it matches the documented policy.
+
+Verified `GET /projects/public/{slug}` genuinely requires zero authentication: curl with NO Authorization header returned 200 with the public summary - confirmed empirically, not assumed, since the whole purpose of a "public" endpoint is defeated if it silently required a token.
+
+Caught and investigated a real nuance in `GET /projects/{project_id}`'s response-code consistency: an authenticated stranger (Bob) requesting a private project he doesn't own or belong to gets 404 (resource-scoped, per Module 03's design). But an UNAUTHENTICATED request to the same private project ID returns 401, not 404 - a different status code depending on authentication state. Reasoned through whether this constitutes a leak: it does not, because the 401 response is returned by the `OAuth2PasswordBearer` dependency itself, before the route or service layer ever runs - it fires identically for ANY project ID, real or fake, so an unauthenticated caller learns nothing about which IDs exist. The two-tier design (401 = "prove who you are first", 404 = "now that you have, this isn't available to you") separates authentication from authorization as sequential concerns, which is a common, accepted pattern (e.g. GitHub's own private-repo behavior works the same way).
+
+Empirically confirmed the design holds up under the harder test: compared an authenticated stranger's request to a genuinely NONEXISTENT project ID (999999999) against the same stranger's request to a real, private, unauthorized project ID (70). Both returned byte-for-byte identical response shapes: 404, `{"detail": "Project <id> not found", "code": "not_found"}` - the only difference being the caller's own input echoed back, not any information about the project. This confirms Module 07's `get_visible_project_or_404` design genuinely closes the enumeration channel for authenticated users, which is the harder and more important case to get right, since an attacker with a valid account (not just an anonymous one) is the more realistic threat model for probing private resource existence.
+
 ---
 
 ## Module entry template
