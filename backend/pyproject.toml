@@ -9,9 +9,11 @@ description = "FastAPI health-check starter for the full-stack intern workshop"
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "alembic==1.14.1",
+  "argon2-cffi==23.1.0",
   "fastapi==0.139.2",
   "pydantic-settings==2.14.2",
   "psycopg[binary]==3.3.4",
+  "PyJWT==2.13.0",
   "sqlalchemy==2.0.51",
   "uvicorn[standard]==0.51.0",
 ]

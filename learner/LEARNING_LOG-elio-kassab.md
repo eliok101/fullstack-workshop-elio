@@ -1260,6 +1260,36 @@ Confirmed via `/openapi.json` (queried directly, not assumed) that `status` and 
 
 ---
 
+### Module 08 — Authentication, authorization, and API security
+
+**Date and branch**
+
+- Date: 2026-08-10
+- Branch: learning/08-authentication
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Implement real password storage with Argon2, JWT-based access/refresh authentication with a token-type discriminator, a reusable current-user dependency replacing `FAKE_CURRENT_USER_ID` everywhere, deliberate CORS/cookie configuration, and frontend-safe error behavior - explicitly a training baseline, not a production-hardened system.
+
+**Work completed so far**
+
+Step 1 - password storage with Argon2:
+
+Confirmed neither `argon2-cffi` nor a JWT library existed in `backend/pyproject.toml` yet, despite both being named in project docs (`docs/security.md` names `argon2-cffi`; `VERSION_MATRIX.md` pins `PyJWT==2.13.0` specifically, not `python-jose` or `passlib`). Added both as real runtime dependencies (not dev extras), matching the version already specified in the project's own documentation rather than guessing.
+
+Discussed why a fast general-purpose hash (e.g. SHA-256) is unsuitable for passwords even though it's ideal for file integrity checks: SHA-256's speed, which is a feature for integrity verification, becomes a liability for passwords, since a stolen database lets an attacker try billions of guesses per second on commodity hardware. Password hashing algorithms (Argon2, bcrypt, scrypt) are deliberately slow and memory-intensive to make brute-forcing expensive. Also discussed why hashing (irreversible) is correct over encryption (reversible): the application only ever needs to verify a password, never recover it, so there should be no decryption key that could unlock every password at once if the database and key were both compromised.
+
+Created `backend/app/core/security.py` with `hash_password` and `verify_password` using Argon2's `PasswordHasher`. Deliberately narrow exception handling in `verify_password`: only `VerifyMismatchError` (wrong password, a normal/expected authentication outcome) is caught and converted to a clean `False` return. Any other exception (e.g. a malformed or corrupted stored hash) is deliberately allowed to propagate rather than being silently treated as "login failed" - a corrupted hash indicates a real bug or data problem (bad migration, wrong algorithm, manual database tampering) that should be surfaced and investigated, not hidden behind a generic authentication failure message.
+
+Verified all four properties empirically:
+1. Correct password verifies -> `True`.
+2. Wrong password -> cleanly returns `False` (`VerifyMismatchError` caught as designed).
+3. Malformed/non-Argon2 hash -> raises `InvalidHashError`, a genuinely distinct exception, confirming it is NOT silently swallowed by the narrow `except` clause.
+4. Hashing the identical password twice produces two different hash strings, confirming Argon2's per-hash random salt is working (this is also why two users with the same password never have identical database rows).
+
+---
+
 ## Module entry template
 
 ### Module NN — title
