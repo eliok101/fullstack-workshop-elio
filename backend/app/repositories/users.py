@@ -1,4 +1,5 @@
 """Focused query operations for the User resource."""
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 

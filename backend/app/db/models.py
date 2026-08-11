@@ -49,6 +49,9 @@ class Project(Base):
     tasks: Mapped[list["Task"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    members: Mapped[list["ProjectMember"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class TaskStatus(str, PyEnum):
@@ -70,7 +73,7 @@ class ProjectMember(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     role: Mapped[str] = mapped_column(String(50), default="member")
 
-    project: Mapped["Project"] = relationship()
+    project: Mapped["Project"] = relationship(back_populates="members")
     user: Mapped["User"] = relationship()
 
 

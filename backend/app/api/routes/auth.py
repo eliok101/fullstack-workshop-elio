@@ -1,4 +1,5 @@
 """Authentication routes."""
+
 from fastapi import APIRouter, Cookie, Depends, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -31,7 +32,9 @@ def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
     )
 
 
-@router.post("/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED
+)
 def register(payload: UserRegister, db: Session = Depends(get_db)) -> UserPublic:
     user = register_user(db, payload.email, payload.full_name, payload.password)
     return UserPublic.model_validate(user)

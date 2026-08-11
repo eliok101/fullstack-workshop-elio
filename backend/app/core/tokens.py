@@ -1,4 +1,5 @@
 """JWT access/refresh token creation and verification."""
+
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
@@ -31,7 +32,9 @@ def _create_token(user_id: int, token_type: TokenType, expires_delta: timedelta)
 def create_access_token(user_id: int) -> str:
     settings = get_settings()
     return _create_token(
-        user_id, TokenType.ACCESS, timedelta(minutes=settings.access_token_expire_minutes)
+        user_id,
+        TokenType.ACCESS,
+        timedelta(minutes=settings.access_token_expire_minutes),
     )
 
 
