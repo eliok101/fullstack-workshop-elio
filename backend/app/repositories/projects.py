@@ -3,7 +3,7 @@
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Project, ProjectMember, Task, TaskStatus, User
+from app.db.models import Project, ProjectMember, Task, TaskStatus
 
 
 def get_project_by_id(db: Session, project_id: int) -> Project | None:
@@ -55,7 +55,3 @@ def get_project_task_counts(db: Session, project_id: int) -> tuple[int, int]:
 
 def slug_exists(db: Session, slug: str) -> bool:
     return get_project_by_slug(db, slug) is not None
-
-
-def get_user_by_email(db: Session, email: str) -> User | None:
-    return db.execute(select(User).where(User.email == email)).scalar_one_or_none()

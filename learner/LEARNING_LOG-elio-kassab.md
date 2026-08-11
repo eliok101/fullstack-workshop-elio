@@ -1260,6 +1260,214 @@ Confirmed via `/openapi.json` (queried directly, not assumed) that `status` and 
 
 ---
 
+### Module 08 — Authentication, authorization, and API security
+
+**Date and branch**
+
+- Date: 2026-08-10
+- Branch: learning/08-authentication
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Implement real password storage with Argon2, JWT-based access/refresh authentication with a token-type discriminator, a reusable current-user dependency replacing `FAKE_CURRENT_USER_ID` everywhere, deliberate CORS/cookie configuration, and frontend-safe error behavior - explicitly a training baseline, not a production-hardened system.
+
+**Work completed so far**
+
+Step 1 - password storage with Argon2:
+
+Confirmed neither `argon2-cffi` nor a JWT library existed in `backend/pyproject.toml` yet, despite both being named in project docs (`docs/security.md` names `argon2-cffi`; `VERSION_MATRIX.md` pins `PyJWT==2.13.0` specifically, not `python-jose` or `passlib`). Added both as real runtime dependencies (not dev extras), matching the version already specified in the project's own documentation rather than guessing.
+
+Discussed why a fast general-purpose hash (e.g. SHA-256) is unsuitable for passwords even though it's ideal for file integrity checks: SHA-256's speed, which is a feature for integrity verification, becomes a liability for passwords, since a stolen database lets an attacker try billions of guesses per second on commodity hardware. Password hashing algorithms (Argon2, bcrypt, scrypt) are deliberately slow and memory-intensive to make brute-forcing expensive. Also discussed why hashing (irreversible) is correct over encryption (reversible): the application only ever needs to verify a password, never recover it, so there should be no decryption key that could unlock every password at once if the database and key were both compromised.
+
+Created `backend/app/core/security.py` with `hash_password` and `verify_password` using Argon2's `PasswordHasher`. Deliberately narrow exception handling in `verify_password`: only `VerifyMismatchError` (wrong password, a normal/expected authentication outcome) is caught and converted to a clean `False` return. Any other exception (e.g. a malformed or corrupted stored hash) is deliberately allowed to propagate rather than being silently treated as "login failed" - a corrupted hash indicates a real bug or data problem (bad migration, wrong algorithm, manual database tampering) that should be surfaced and investigated, not hidden behind a generic authentication failure message.
+
+Verified all four properties empirically:
+1. Correct password verifies -> `True`.
+2. Wrong password -> cleanly returns `False` (`VerifyMismatchError` caught as designed).
+3. Malformed/non-Argon2 hash -> raises `InvalidHashError`, a genuinely distinct exception, confirming it is NOT silently swallowed by the narrow `except` clause.
+4. Hashing the identical password twice produces two different hash strings, confirming Argon2's per-hash random salt is working (this is also why two users with the same password never have identical database rows).
+
+**Step 2 - token claims and type discrimination**
+
+Design discussion before writing code: reasoned through why signature verification must happen BEFORE checking the `token_type` claim, not after. Until a JWT's signature is verified, every claim in its payload (including `token_type`) is untrusted, attacker-controllable data - checking type first would mean making a security decision based on forgeable input. The correct order is: verify signature and expiration first (establishing the payload can be trusted), then inspect claims like `token_type`. This generalizes to a broader principle: never make authorization decisions from untrusted data before authentication has established trust.
+
+Created `backend/app/core/tokens.py`: `create_access_token`, `create_refresh_token`, and `decode_token(token, expected_type)`. Each token carries `sub` (user id), `type` (access/refresh, via a `TokenType` `StrEnum`), `iat`, and `exp`. `decode_token` verifies signature/expiration via PyJWT first, THEN explicitly checks `payload.get("type") == expected_type.value`, raising a custom `InvalidTokenError` on any failure (bad signature, expired, wrong type, or missing/invalid subject).
+
+Deliberate security choice confirmed: the signing algorithm (HS256) is hardcoded in `decode_token`, not read from settings or trusted from the token's own header - this prevents algorithm-confusion attacks, where an attacker crafts a token specifying a different or absent algorithm (e.g. `"alg": "none"`) hoping the server will trust the token's own declaration instead of enforcing one server-side.
+
+Verified empirically with 6 checks, the two most important being the direct proof against Module 08's explicitly named failure mode ("accepting any valid JWT without checking token type"):
+1. Access token create/decode round trip -> correct user id.
+2. Refresh token create/decode round trip -> correct user id.
+3. A genuinely valid, correctly-signed refresh token presented to `decode_token(..., TokenType.ACCESS)` -> correctly rejected with `InvalidTokenError`, proving the cross-type substitution attack designed against is actually blocked in the real implementation, not just theoretically.
+4. The reverse case (access token presented as refresh) -> also correctly rejected.
+5. A tampered signature (corrupted last 5 characters) -> correctly rejected with a signature verification failure.
+6. A garbage, non-JWT string -> correctly rejected with a malformed-token error.
+
+**Step 3 (part 1) - authentication service, with two real security gaps caught before shipping**
+
+Created `backend/app/repositories/users.py` (`get_user_by_email`, `get_active_user_by_id` with query-level `is_active` filtering - chosen deliberately for consistency with login's information-hiding principle, rather than a two-step load-then-check that could distinguish "inactive" from "nonexistent" internally). Moved `get_user_by_email` out of `projects.py` into this new file, consistent with Module 07's "focused repositories per entity" principle - a User-related function didn't belong bolted onto the Project repository.
+
+Design discussion before writing register/login logic: reasoned through why `authenticate_user`'s failure check must be a single combined condition (`user is None or not verify_password(...)`) raising one identical error, rather than two separate checks with different messages - the earlier resource-scoped-404 principle from Module 03 applied to authentication: revealing "no such account" vs. "wrong password" as distinct outcomes would let an attacker enumerate valid emails.
+
+Created `backend/app/services/auth.py` with `register_user`, `authenticate_user`, `create_token_pair`. Two real, non-obvious security gaps were caught during review, both fixed rather than deferred:
+
+1. Timing side-channel: the initial implementation of `authenticate_user` short-circuited on `user is None`, meaning `verify_password`'s deliberately slow Argon2 computation only ran when a matching user existed. Even with an identical error message and status code, this meant response TIMING alone could reveal whether an email was registered - the "constant-style generic error" requirement was satisfied in message content but not in actual behavior. Fixed by always calling `verify_password` unconditionally, using a fixed dummy hash (computed once at module load) when no user is found, so the expensive Argon2 computation runs on every login attempt regardless of outcome.
+
+2. Registration race condition (TOCTOU): `register_user`'s email-uniqueness pre-check (`get_user_by_email` -> `ConflictError`) is the same "friendlier error" pattern already used for project slugs in Module 06/07, where the database's own unique constraint is the true authoritative guarantee - but unlike the slug-generation code, the initial version didn't catch the `IntegrityError` a genuine race (two concurrent registrations for the same email) would raise, meaning a real race would have surfaced as an unhandled 500 instead of a clean 409. Fixed by wrapping `db.flush()` in a `try/except IntegrityError`, converting it to the same `ConflictError`.
+
+Verified the timing fix rigorously, not just once: a single-sample timing check first showed an ambiguous ~13.8ms gap (9% of the ~150ms base) - rather than declaring success or failure from one measurement, reran as a proper statistical comparison across 20 iterations per path with a discarded warmup call. Result: nonexistent-email mean 179.84ms (stdev 39.52ms) vs. wrong-password mean 173.65ms (stdev 40.16ms) - a 6.18ms mean difference, far smaller than either distribution's ~40ms standard deviation, confirming the difference is statistically indistinguishable from noise. Contrasted against the pre-fix gap, which would have been orders of magnitude larger (sub-millisecond vs. ~150-180ms, since `verify_password` wouldn't have run at all) - the fix demonstrably closes a real, measurable side channel, not just a theoretical one.
+
+**Step 3 (part 2) and Step 4 - auth routes, current-user dependency, and full live verification**
+
+Created `backend/app/api/deps.py` with `get_current_user`: extracts the bearer token via FastAPI's `OAuth2PasswordBearer` (a single reusable dependency, not per-route manual logic, per the module's explicit requirement), decodes it as an ACCESS token specifically (reusing the type-discrimination from Step 2), and loads the user via `get_active_user_by_id` - both failure paths (bad/expired/wrong-type token, or user not found/inactive) return the identical 401 "Could not validate credentials" with a `WWW-Authenticate: Bearer` header, per OAuth2 convention.
+
+Created `backend/app/api/routes/auth.py` with all five documented endpoints (`register`, `login`, `refresh`, `logout`, `me`), matching `api-contract.md` exactly: login accepts `OAuth2PasswordRequestForm` (form-encoded, not JSON), returns `{access_token, token_type, expires_in}` and sets the refresh token as an `HttpOnly` cookie scoped to `/api/v1/auth`, with `secure=True` gated on `settings.environment == "production"` (not always-on, since local HTTP development needs `secure=False` to work at all - and not always-off, since production over HTTPS needs it enabled).
+
+Real dependency gap caught and fixed mid-build: the app crashed entirely on startup (`RuntimeError: Form data requires "python-multipart" to be installed`) - `OAuth2PasswordRequestForm` needs this separate package, and it had never been added to `pyproject.toml`, same category of miss as `email-validator` earlier in this module. Added `python-multipart==0.0.20`, rebuilt, confirmed healthy.
+
+Caught before shipping: a prefix-duplication risk, since `auth.router` declares `prefix="/auth"` itself - verified `router.py` includes it the same bare way as `projects.router`/`tasks.router` (no additional prefix argument), and confirmed via the actual OpenAPI schema (not assumed) that all five routes resolve to the correct paths (`/api/v1/auth/register`, `/login`, `/refresh`, `/logout`, `/me`) with no doubling or missing segments.
+
+Full live walkthrough, 9 scenarios, all correct:
+1. `POST /auth/register` -> 201, user object (no `password_hash`).
+2. `POST /auth/login` (correct credentials) -> 200, real `access_token` + `Set-Cookie: refresh_token=...; HttpOnly`.
+3. `GET /auth/me` with the real access token -> 200, correct user info.
+4. `POST /auth/refresh` with the cookie -> 200, a genuinely NEW access token (different from the login one).
+5. `POST /auth/logout` -> 200, cookie cleared.
+6. `GET /auth/me` with no Authorization header -> 401.
+7. `GET /auth/me` with a garbage token string -> 401 (decode failure correctly caught).
+8. `POST /auth/login` with the correct email but wrong password -> 401, identical generic message to a nonexistent-email attempt (per Step 3's timing-safe design).
+9. `POST /auth/register` with an already-registered email -> 409 (the pre-check path, not the race-condition `IntegrityError` path, but confirms the pre-check itself works correctly for the non-concurrent case).
+
+Real inconsistency surfaced by the walkthrough, not yet fixed: three distinct 401 response body shapes exist across the auth surface depending on exactly which check fails - `{"detail":"Not authenticated"}` (FastAPI's own `OAuth2PasswordBearer`, no header at all), `{"detail":"Could not validate credentials"}` (`get_current_user`'s explicit `HTTPException`, bad/expired token), and `{"detail":"Invalid email or password","code":"unauthorized"}` (the app's standard `AppError`/`UnauthorizedError` shape, used by login/refresh). Only the third includes the `code` field every other domain error in this API has. Flagged as a real gap to address, not silently accepted as "it returned 401 so it's fine."
+
+This is the first time the complete auth system (hashing, tokens, timing-safe login, race-safe registration, cookie handling, current-user extraction) has been proven working together through real HTTP traffic, rather than each piece verified only in isolation via direct Python calls.
+
+**FAKE_CURRENT_USER_ID formally retired**
+
+Replaced every use of `FAKE_CURRENT_USER_ID` in `backend/app/api/routes/projects.py` and `backend/app/api/routes/tasks.py` with the real `current_user: User = Depends(get_current_user)` dependency, using `current_user.id` everywhere the placeholder used to be. The constant and its comment (pointing back to this log, added during Module 07's Step 7) are now fully removed - the gap it documented is closed.
+
+Verified live, with a freshly registered and logged-in real user:
+- `POST /api/v1/projects` WITH a valid Bearer token -> 201, project created, owned by the real authenticated user.
+- `GET /api/v1/projects` WITH the token -> 200, correctly lists the project.
+- `POST /api/v1/projects` WITHOUT any Authorization header -> 401 (this exact request would have silently succeeded under the old `FAKE_CURRENT_USER_ID` placeholder, since there was no real check to fail).
+- `GET /api/v1/projects` WITHOUT any Authorization header -> 401.
+
+This is the concrete, empirical closure of the scaffolding gap flagged honestly throughout Module 07: project and task routes are now genuinely protected by real authentication, not a hardcoded constant that happened to always succeed.
+
+**Step 5 - authorization audit**
+
+Reviewed every route against two questions: does it require authentication, and if it operates on a specific resource, does it verify the AUTHENTICATED user (not just "any logged-in user") has the correct relationship to that resource. This mattered specifically because every route was originally built and tested exclusively against `FAKE_CURRENT_USER_ID` - a single, unchanging user - meaning no test or manual check before now could have surfaced a genuine multi-user authorization gap.
+
+Full route inventory reviewed:
+
+| Route | Auth required | Resource-level check |
+|---|---|---|
+| `POST /auth/register`, `/login` | No (by design) | N/A |
+| `POST /auth/refresh`, `/logout` | Cookie-based, not Bearer | N/A |
+| `GET /auth/me` | Yes | Returns only the caller's own identity |
+| `GET /projects/public/{slug}` | No (by design) | `is_public` check in service layer |
+| `GET`/`POST /projects`, `GET`/`PATCH`/`DELETE /projects/{id}` | Yes | Visibility (list/get) or ownership (patch/delete) |
+| `GET`/`POST /projects/{id}/tasks`, `GET`/`PATCH`/`DELETE .../tasks/{id}` | Yes | Visibility (owner OR member) for all task operations |
+
+Confirmed by design, not oversight: task operations (create/update/delete) are visibility-gated (owner OR member), not ownership-gated - this is the exact policy decided and justified in Module 07. In a genuine multi-user scenario, this means a project MEMBER (not just the owner) can edit or delete another member's tasks. This surprised no one on paper before, since `FAKE_CURRENT_USER_ID` meant "member" and "owner" were always the same single user - now that real distinct users exist, this design consequence is real and worth being deliberate about, but it is not a bug; it matches the documented policy.
+
+Verified `GET /projects/public/{slug}` genuinely requires zero authentication: curl with NO Authorization header returned 200 with the public summary - confirmed empirically, not assumed, since the whole purpose of a "public" endpoint is defeated if it silently required a token.
+
+Caught and investigated a real nuance in `GET /projects/{project_id}`'s response-code consistency: an authenticated stranger (Bob) requesting a private project he doesn't own or belong to gets 404 (resource-scoped, per Module 03's design). But an UNAUTHENTICATED request to the same private project ID returns 401, not 404 - a different status code depending on authentication state. Reasoned through whether this constitutes a leak: it does not, because the 401 response is returned by the `OAuth2PasswordBearer` dependency itself, before the route or service layer ever runs - it fires identically for ANY project ID, real or fake, so an unauthenticated caller learns nothing about which IDs exist. The two-tier design (401 = "prove who you are first", 404 = "now that you have, this isn't available to you") separates authentication from authorization as sequential concerns, which is a common, accepted pattern (e.g. GitHub's own private-repo behavior works the same way).
+
+Empirically confirmed the design holds up under the harder test: compared an authenticated stranger's request to a genuinely NONEXISTENT project ID (999999999) against the same stranger's request to a real, private, unauthorized project ID (70). Both returned byte-for-byte identical response shapes: 404, `{"detail": "Project <id> not found", "code": "not_found"}` - the only difference being the caller's own input echoed back, not any information about the project. This confirms Module 07's `get_visible_project_or_404` design genuinely closes the enumeration channel for authenticated users, which is the harder and more important case to get right, since an attacker with a valid account (not just an anonymous one) is the more realistic threat model for probing private resource existence.
+
+**Step 6 - deliberate CORS configuration**
+
+Design discussion before testing: reasoned through why CORS is not an authorization mechanism. CORS is a browser-enforced restriction on what JavaScript running on a given origin is allowed to READ from a cross-origin response - it does nothing to stop the underlying HTTP request from being made or processed by the server. Non-browser clients (curl, Postman, scripts, mobile apps, other backend servers) don't implement or respect CORS at all, so a request to `POST /api/v1/auth/login` via curl succeeds or fails purely based on server-side authentication/authorization logic, completely independent of any CORS configuration. This is why authentication and authorization must always be enforced server-side, regardless of how tightly CORS is configured.
+
+Reviewed the existing `CORSMiddleware` configuration (`backend/app/main.py`, established in Module 05): `allow_origins` read from `settings.cors_origins` (default: `http://localhost:3000`), `allow_credentials=True`, `allow_methods=["*"]`, `allow_headers=["*"]`.
+
+Ran a real `OPTIONS` preflight test against a disallowed origin to verify the configuration actually enforces what it claims, not just that it's written correctly:
+
+```bash
+curl -i -X OPTIONS http://localhost:8000/api/v1/auth/login -H "Origin: https://evil-site.com" -H "Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers: content-type"
+```
+
+Initial concern: curl displayed the full response regardless of the `Origin` header, which could look like a CORS bypass. Correctly reasoned through why this is expected, not a bug: curl doesn't enforce CORS at all (it's not a browser), so it will always show the response - the actual test is whether the response would let a BROWSER's JavaScript read it, which depends entirely on the presence and value of the `Access-Control-Allow-Origin` header, not on whether curl can see the response body.
+
+Confirmed the real answer via the complete, unabridged response headers: `400 Bad Request`, and `Access-Control-Allow-Origin` is entirely absent from the response - not present with an empty value, not present at all. This confirms Starlette's `CORSMiddleware` is correctly refusing to emit the allow-origin header for a disallowed origin, which is exactly the signal a real browser relies on to block page JavaScript from using the response - even though the raw HTTP response still reaches any non-browser client, as expected.
+
+Then ran the same preflight against the ALLOWED origin (`http://localhost:3000`) and confirmed `Access-Control-Allow-Origin: http://localhost:3000` IS present in that response, alongside `allow-credentials: true` and the full allowed methods/headers list - the middleware correctly differentiates based on the actual `Origin` header sent.
+
+**Step 7 - frontend-safe error behavior**
+
+Design discussion before testing: reasoned through why leaking a stack trace from an authentication endpoint specifically is worse than from a simple endpoint like `/health/live`. A traceback from an auth route can reveal reconnaissance-valuable internals - the password hashing library in use, JWT validation flow, database model structure, internal file paths, and exception-handling logic - none of which are direct exploits by themselves, but which meaningfully help an attacker understand and target the authentication system more precisely. The correct principle: log the full exception server-side, return only a generic message to the client - the same "don't reveal internal detail in the client-facing message" discipline already established for `verify_password` (Step 1) and `_check_readiness` (Module 05).
+
+Verified empirically rather than assumed, using a deliberately added, temporary debug route that raised `RuntimeError("...db_password=hunter2")` - a fake secret embedded specifically to trace where the boundary between server-log and client-response actually falls.
+
+Findings:
+1. Client-facing response: curl showed a clean, generic `500 Internal Server Error` with plain-text body `"Internal Server Error"` - no traceback, no exception message, no file paths, and critically, the embedded fake secret (`db_password=hunter2`) never appeared anywhere in the HTTP response.
+2. Server-side logs: `docker compose logs backend` showed the COMPLETE traceback, including exact file paths, line numbers, and the full exception message with the fake secret intact - confirming an operator with legitimate log access retains everything needed to diagnose a real failure.
+3. Confirmed the correct disclosure boundary is already in place for genuinely unhandled exceptions, without needing any additional handler - FastAPI/Starlette's default unhandled-exception behavior already achieves the log/response split this step is asking for, since debug mode is not enabled anywhere (confirmed no `debug=True` in `main.py`, and the Dockerfile's `--reload` flag only affects code-reload behavior, not error verbosity).
+4. Important refinement beyond the mechanical test: the real discipline is not "the client/log split will protect me" as a safety net - it's "never interpolate secrets into exception messages in the first place." The test intentionally embedded a fake secret to prove the boundary holds, but a properly written codebase should never rely on that boundary catching a real secret that shouldn't have been placed in exception text to begin with. This is now noted as a coding discipline, not just a response-shape check.
+5. Bonus finding, connecting back to Step 3's request-ID middleware (Module 05): the crash traceback showed the exception propagating directly through `RequestIDMiddleware`'s `dispatch` method at the `call_next(request)` line - confirming that when a route raises before returning normally, the middleware never reaches the line that attaches `X-Request-ID` to the response. This means a genuinely crashed request's error response currently lacks a request ID, which would make correlating a specific failed request to its log entry harder in production - a real, minor gap worth noting, though out of scope to fix as part of this security-focused module.
+
+Confirmed cleanup: removed the temporary debug route, verified via curl it returns 404, and confirmed `git status`/`diff` show no trace of the crash-test route in the committed code.
+
+**Step 8 - security tests**
+
+Created `backend/tests/test_auth_security.py`, automating the key security properties verified manually throughout this module: token type discrimination (refresh rejected as access and vice versa), protected routes rejecting missing/garbage auth, full register-login-access-protected-route flow (also asserting `password_hash` never appears in the register response), wrong-password and nonexistent-email login attempts returning byte-for-byte identical error responses (automating the timing-safety design from Step 3), duplicate registration returning 409, and both CORS preflight cases (disallowed origin gets no `Access-Control-Allow-Origin` header, allowed origin gets the correct one) - automating the Step 6 findings permanently rather than relying on manual curl checks going forward.
+
+`9 passed, 1 warning in 6.79s` (`docker compose run --rm backend pytest tests/test_auth_security.py -v`).
+
+Real regression caught by running the full suite, not just the new file: `test_projects_api.py` and `test_tasks_api.py` (Module 07) still imported `FAKE_CURRENT_USER_ID`, which no longer exists after this module's earlier retirement of that placeholder - breaking test collection entirely (`2 errors during collection`, not a test failure but a hard import error). Fixed by rewriting both files' fixtures to register and log in a real, unique test user per test run (via the actual `/auth/register`/`/auth/login` endpoints) and pass a genuine Bearer token on every call that now requires authentication, instead of relying on a hardcoded fake user id.
+
+Full suite reverified after the fix: `43 passed, 1 warning in 15.42s` (up from 34 after Module 07 - 9 new security tests) - confirming all prior work (health, status, echo, request-id, projects, tasks, transactions, task transitions, and now auth security) still passes together.
+
+**Independent challenge - refresh-token rotation and revocation (design-only ADR)**
+
+Per the module's own stated allowance ("A design-only ADR is acceptable if implementation is out of cohort scope"), authored a design-only ADR rather than implementing it, given the scope of a full implementation (new table, migration, concurrency-safe rotation logic, and a real concurrency test) versus the module's remaining time budget.
+
+Placement decision: the task originally specified `docs/adr/0001-...`, but this repo already has an established, populated ADR location - `docs/decision-records/`, referenced directly in `CLAUDE.md` and containing five existing ADRs (`001`-`005`), including `005-jwt-access-and-cookie-refresh.md`, the exact prior decision this new one extends (it documents the current baseline's refresh-cookie design and explicitly lists "refresh tokens lack rotation, revocation, reuse detection" as a known negative consequence). Creating a separate `docs/adr/` directory would have fragmented where architectural decisions live in this repo for no benefit. Placed the new document at `docs/decision-records/006-refresh-token-rotation-and-revocation.md` instead, matching the existing numbering/naming convention, and cross-referenced ADR 005 and ADR 006 to each other.
+
+Design covers, deliberately reusing patterns already established and proven elsewhere in this workshop:
+- Data model: a new `refresh_sessions` table storing a HASHED token identifier (never the raw token - same never-store-recoverable-secrets principle as Argon2 password hashing from Step 1), with `issued_at`/`expires_at`/`revoked_at`/`replaced_by_id` forming a traceable rotation chain.
+- Rotation: single-use refresh tokens - each successful refresh revokes the current session row and issues a new one, linked via `replaced_by_id`.
+- Reuse detection: presenting an already-revoked token is treated as evidence of compromise (not assumed to be a benign retry), triggering full-chain revocation and a generic 401 - consistent with Step 7's frontend-safe error principle of never explaining the specific reason for a security-relevant rejection.
+- Concurrency: explicitly identifies the need for row-level locking (`SELECT ... FOR UPDATE`) around the check-then-revoke-then-create sequence, to prevent two simultaneous requests with the same valid token both succeeding - directly reusing the transaction-atomicity discipline proven in Module 06's empirical atomicity tests.
+- Logout: would actually revoke the session server-side, closing the gap identified in Step 9 where the current baseline's logout only clears a client-side cookie with no server-side effect.
+- Distinguishes single-session revocation (automatic, triggered by reuse detection) from full-account revocation (a separate, heavier action for account-recovery scenarios).
+- Named the test cases a real implementation would require, without writing them: single-use enforcement, reuse-triggers-full-chain-revocation, genuine concurrent-request safety (not just sequential calls), logout's server-side effect, and database-level expiry enforcement independent of the JWT's own `exp` claim.
+- Consequences section honestly notes what this design does NOT solve (a stolen access token remains valid until its own short natural expiry - this ADR only addresses the refresh-token layer) and the accepted tradeoff of treating any reuse as compromise (favoring security over convenience, with a possible future refinement).
+
+**Step 9 - threat notes**
+
+An honest catalog of what this authentication implementation protects against, what it explicitly does not, and why - per `docs/security.md`'s framing that Workboard is "an educational reference" that "demonstrates baseline controls" without production-level hardening.
+
+Real gaps found and fixed this module (empirically verified, not hypothetical):
+1. Login timing side-channel: originally, `verify_password` only ran when a matching user existed, meaning response timing alone could reveal whether an email was registered even with an identical error message. Fixed by always running the deliberately-slow Argon2 verification against a dummy hash when no user matches, then rigorously confirmed via 20-iteration statistical timing comparison that the fix closes the gap (6.18ms mean difference against ~40ms standard deviation - statistically indistinguishable from noise).
+2. Registration race condition (TOCTOU): the email-uniqueness pre-check alone would have let two concurrent registrations for the same email both pass, with the second failing as an unhandled 500 instead of a clean 409 under real concurrent load. Fixed by catching the database's own `IntegrityError` as the authoritative guarantee, the same pattern already established for project slugs in Module 06/07.
+3. Investigated (not a gap): a 401-vs-404 status code difference based on authentication state for `GET /projects/{id}`. Confirmed empirically this does not leak resource existence, since the 401 fires identically for any project ID before the route logic runs at all - the harder case (an authenticated stranger comparing a real private project against a genuinely nonexistent one) returns byte-for-byte identical 404 responses, confirming Module 07's resource-scoped design holds under real multi-user conditions.
+4. Confirmed (not a gap): CORS is correctly configured and empirically verified to reject disallowed origins - `Access-Control-Allow-Origin` is entirely absent from preflight responses for an unrecognized `Origin`, with a 400 status. Also explicitly confirmed via design discussion that CORS is not and cannot be an authorization mechanism - it only restricts browser JavaScript, never non-browser clients like curl or scripts, so server-side authentication/authorization remains the only real enforcement boundary regardless of CORS configuration.
+
+Explicitly out of scope for this baseline (per the module's own stated boundary), with concrete impact if exploited:
+
+1. No refresh-token rotation, reuse detection, or revocation. If a refresh token is stolen (compromised device, XSS, etc.), the attacker can repeatedly call `POST /auth/refresh` to mint new access tokens and act as the victim for the token's full lifetime (currently `refresh_token_expire_days`), with no server-side way to distinguish the attacker's use from the legitimate user's - both can refresh independently and simultaneously, since nothing invalidates a refresh token after use. This is precisely the gap the independent challenge addresses.
+
+2. No account lockout or rate limiting on login attempts. Since timing is now normalized (finding #1 above), the remaining risk is unlimited guess attempts - an attacker can attempt unlimited password guesses against a known email with no throttling or lockout, making online brute-force attacks against weak passwords feasible over a long enough time window.
+
+3. No email verification or password reset flow. A registered email is never confirmed to be owned by the registrant, and there is no self-service account recovery path - both explicitly listed in `docs/security.md`'s pre-production checklist.
+
+4. Access tokens cannot be revoked before natural expiration. Logout only clears the refresh cookie; an already-issued access token remains valid until it expires on its own (currently `access_token_expire_minutes`), even if the user "logs out" or an admin wants to force a session to end immediately.
+
+5. This module's CORS configuration is tuned for a same-site local training environment (frontend and backend on localhost, different ports). `docs/security.md` explicitly flags that cross-site custom-domain production deployments need separate review of cookie domain, `SameSite` attribute, and TLS termination - not assumed to already be handled by this training baseline.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - Argon2 password hashing (and why hashing differs from encryption, why fast general-purpose hashes are unsuitable for passwords), JWT access/refresh tokens with type discrimination, the current-user dependency that replaced `FAKE_CURRENT_USER_ID`, timing-safe login and race-safe registration, CORS configuration and empirical verification, frontend-safe error handling (log server-side, generic response client-side), and the refresh-token rotation/reuse-detection/revocation design.
+- I can explain it without the reference code: yes - CORS is browser-enforced only and restricts nothing for curl/Postman/scripts, so server-side authentication/authorization is the only real enforcement boundary regardless of CORS configuration; JWT signature verification must precede any claim inspection (including token type) because every claim is attacker-controlled, forgeable data until the signature proves the token's authenticity; login timing must be normalized because even an identical error message can leak account existence if the expensive password-verification step only runs conditionally, since an attacker can statistically distinguish response times across many requests.
+- I can diagnose one failure in this area: mostly yes - confident designing and implementing a similar authentication system end-to-end (registration, hashing, JWT access/refresh, current-user dependency, protected routes, logout, authorization checks, CORS, security tests) for a different project, and explaining the reasoning behind each decision, not just the syntax. Would still rely on documentation for framework-specific library APIs I haven't used yet (e.g. OAuth/OIDC integration, distributed session revocation, signing-key rotation) and for attack classes genuinely outside what this module covered.
+- Confidence from 1-5: 5/5 for this module's scope specifically - engaged with essentially every design decision rather than accepting generated code as-is, caught two real security gaps before they shipped (timing side-channel, registration race condition) and empirically verified both fixes rather than assuming them correct, and reasoned through real attack scenarios (token substitution, stolen refresh tokens, resource enumeration, stack-trace leakage) rather than just describing APIs. Holding this to the same standard as earlier modules' 4-4.5 ratings, the honest remaining gap toward broader authentication mastery is exposure to framework-specific auth integrations and attack classes not covered here, not a gap in the reasoning demonstrated this module.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
