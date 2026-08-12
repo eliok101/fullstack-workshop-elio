@@ -44,6 +44,7 @@ services:
       target: development
     environment:
       NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-http://localhost:8000/api/v1}
+      NUXT_INTERNAL_API_BASE: ${NUXT_INTERNAL_API_BASE:-http://backend:8000/api/v1}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     volumes:

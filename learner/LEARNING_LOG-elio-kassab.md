@@ -1639,6 +1639,158 @@ All three mutation-drill files (`app/services/tasks.py`, `app/services/task_tran
 
 ---
 
+### Module 10 — Nuxt, Vue, and TypeScript foundation
+
+**Date and branch**
+
+- Date: 2026-08-12
+- Branch: learning/10-nuxt-foundation
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Turn the minimal Nuxt skeleton into a typed application shell: separate the private server-side API base (Docker DNS, never shipped to the browser) from the public browser-side API base; define TypeScript contracts that mirror the real backend Pydantic schemas field-for-field, while being explicit that a TypeScript interface is a compile-time promise only and proves nothing about what actually arrives over the wire at runtime; build small, typed, network-free presentational components with focused prop/event contracts; assemble the baseline route pages with real loading/empty/error states rather than assuming success; and verify semantic HTML and keyboard/focus accessibility by actually using the keyboard and an accessibility inspector, not by assuming markup is accessible because it looks right visually.
+
+**Scope decision made up front**
+
+Step 6 explicitly allows temporary local data for authenticated pages "if the API client is not yet wired," and `workshop/11-frontend-api-integration-and-state.md` (confirmed to exist) is where that real client/session layer gets built. So: `/login` and `/register` (client-triggered `$fetch` on submit) and `/public/projects/[slug]` (SSR `useFetch`, genuinely unauthenticated per `docs/api-contract.md`) are wired to the real backend, since none of them need a session to work. `/dashboard`, `/projects`, and `/projects/[id]` use clearly-documented placeholder data (`app/fixtures/placeholder-data.ts`) because they'd need real auth/session state Module 11 hasn't built yet - forcing that early would risk conflicting with what that module builds.
+
+**Work completed so far**
+
+**Step 1 - inspect/initialize Nuxt**
+
+Reviewed `package.json` (scripts: `dev`, `build`, `typecheck`, `postinstall` - no `lint` yet, confirmed against `CLAUDE.md`'s own note), `nuxt.config.ts`, `app/app.vue`, and the `app/` tree (`assets/`, `pages/` only - no `components/` yet). Server-only code today is `server/api/health.get.ts` (a Nitro route, never shipped to the browser); everything else is universal (renders on both server and client); no `.client`-only code exists yet.
+
+```text
+$ docker compose run --rm frontend npm install
+# clean, up to date with the existing lockfile
+```
+
+Dev server already running via the existing `frontend` Compose service (`npm run dev` per the Dockerfile's development stage) - confirmed live: `curl http://localhost:3000/` → 200, `Nuxt 4.4.8 (with Nitro 2.13.4, Vite 7.3.6 and Vue 3.5.40)`, SSR-rendered backend health check (`Nuxt server health: ready`) working. Noted one benign, non-blocking dev-time warning seen in every subsequent log too: `[Vue] Resolve plugin path failed: vue-router/volar/sfc-route-blocks ... ERR_PACKAGE_PATH_NOT_EXPORTED` - an optional Volar plugin path vite-plugin-checker can't resolve in this dependency version; `vue-tsc` still reports `Found 0 errors` immediately after, and every `typecheck`/`lint`/`build` run in this module exits 0 despite it printing.
+
+**Step 2 - TypeScript and runtime settings**
+
+Added `apiInternalBase` (private, server-only) alongside the existing public `apiBase` in `frontend/nuxt.config.ts`, defaulting to Docker DNS `http://backend:8000/api/v1`; wired `NUXT_INTERNAL_API_BASE` into `compose.yaml`'s frontend service and `.env.example`, mirroring the existing `NUXT_PUBLIC_API_BASE` pattern.
+
+Verified the private/public split empirically, not just by writing the code: after recreating the frontend container, confirmed `NUXT_INTERNAL_API_BASE=http://backend:8000/api/v1` is set inside the container's environment, then confirmed it is **absent** from the browser-shipped runtime config:
+
+```text
+window.__NUXT__.config={public:{apiBase:"http://localhost:8000/api/v1"},app:{...}}
+```
+
+Only `public.apiBase` ships to the browser - `apiInternalBase` never appears anywhere in the HTML/JS sent to the client. This is the concrete proof behind the module's own question ("why must public runtime config never contain a secret"): anything under `public` is trivially visible via view-source, so a value that must stay server-only (an internal DNS name today, a real secret in a different config) cannot go there. `npm run typecheck` after the change: exit 0.
+
+**Step 3 - application shell**
+
+Built `app/components/AppHeader.vue` (`<header>` → `<nav aria-label="Main">` with real `<NuxtLink>`s, which render as real `<a>` tags, not clickable `div`s), rewrote `app/app.vue` to a skip-link → header → single `<main id="main-content">` landmark → footer structure, added CSS custom-property design tokens (`--color-*`, `--space-*`, `--radius-*`) and a responsive header breakpoint to `main.css`, and rewrote the home page to describe the Workboard capstone instead of the Module 00 "starter is running" placeholder (while keeping the real SSR backend-health proof).
+
+Verified via the actual served HTML: skip-link present and first in the DOM, exactly one `<main>` landmark, exactly one `<h1>`, real anchor links throughout, viewport meta tag present, SSR health check still renders `ready`.
+
+**Step 4 - TypeScript API contracts**
+
+Created `frontend/shared/types/api.ts` (Nuxt 4's dedicated isomorphic-types directory, auto-imported on both the app and server sides) with `User`, `Project`, `ProjectPublicSummary`, `Task`, `TaskStatus`, `TaskPriority`, `AuthTokenResponse`, request-body types (`UserRegisterRequest`, `ProjectCreateRequest`, `TaskCreateRequest`, `TaskUpdateRequest`), and `ApiErrorBody` - field names and optionality copied directly from `backend/app/schemas/*.py`, not guessed. Timestamps are typed `string`, not `Date`, since JSON has no date type and typing it `Date` would be a lie the compiler can't catch.
+
+Documented the limitation directly in the file's docstring: a TypeScript interface is a compile-time-only promise - nothing validates that JSON actually arriving over the network matches it, and an `as`/generic cast on a fetch response doesn't change that.
+
+Verified the auto-import genuinely works (not just written and hoped): after adding the file, `grep`'d `.nuxt/imports.d.ts`, `.nuxt/types/imports.d.ts`, `.nuxt/types/nitro-imports.d.ts`, and `.nuxt/types/shared-imports.d.ts` and confirmed all four reference `shared/types/api` - meaning these types are usable with zero explicit imports in `.vue` files. Confirmed in practice in Step 5: `StatusBadge.vue` uses `TaskStatus` with no import statement and typechecks clean.
+
+**Step 5 - reusable display components**
+
+Built five presentational components in `app/components/`, each with typed `defineProps`/`defineEmits` and zero network calls: `LoadingIndicator` (`role="status" aria-live="polite"`, takes a `label`), `ErrorAlert` (`role="alert"`, `title`/`message` props), `StatusBadge` (maps `TaskStatus` to a human-readable label - text, not color alone, per the module's own accessibility principle), `ProjectCard`, and `TaskCard` (emits `advance`/`delete` with the task id; Advance is disabled once a task is `done`, mirroring - not replacing - the backend's real transition rule from `task_transitions.py`).
+
+`npm run typecheck`: exit 0 - confirms the auto-imported types (`TaskStatus`, `Project`, `Task`) and Vue's auto-imported `computed` all resolve inside these components with no explicit imports.
+
+**Step 6 - route pages**
+
+Built all 7 baseline routes. Real backend wiring:
+
+- `/public/projects/[slug]`: SSR `useFetch` against the real `GET /api/v1/projects/public/{slug}`. **Found and fixed a real bug here**: the first version used `config.public.apiBase` (`http://localhost:8000/...`) for this SSR-time fetch, which fails inside the frontend *container* because `localhost` there resolves to the container itself, not the backend - the exact `fetch failed` error surfaced when I actually curled the page instead of assuming it worked: `"[GET] \"http://localhost:8000/api/v1/projects/public/...\": <no response> fetch failed"`. Fixed by branching on `import.meta.server` to use `apiInternalBase` (Docker DNS) during SSR and `apiBase` (public) client-side - this is precisely the failure mode Step 2's config split exists to prevent, and I initially built the split correctly but then didn't use it correctly on first wiring a real SSR fetch. Re-verified after the fix by registering a real user, logging in, and creating both a real public project and a real private project via the actual backend, then curling the frontend page directly: the public project rendered its real name/description/task counts; a nonexistent slug and the private project's slug both correctly rendered the "not found" error state (resource-scoped, matching the backend's own don't-confirm-private-existence design from Module 07/08).
+- `/login`, `/register`: real `$fetch` calls to `POST /api/v1/auth/login` (form-urlencoded) and `POST /api/v1/auth/register` (JSON) on submit, with a shared `extractErrorDetail` util (`app/utils/api-error.ts`) that narrows the backend's `{detail, code}` error shape safely under `strict` TypeScript's `unknown` catch-variable typing. Success state explicitly notes that session persistence isn't wired yet (Module 11).
+- `/dashboard`, `/projects`, `/projects/[id]`: documented placeholder data via `useAsyncData` (not a hardcoded ref) so these pages already exercise Nuxt's real loading/error/success async-state primitive - the same one a real fetch will use next module. `/projects/[id]` demonstrates all three states genuinely: a populated task grid (project 1, 3 tasks across all statuses), a real empty state (project 2 has zero fixture tasks), and a real 404 (`createError`) for any id not in the fixture set - verified via curl for ids 1, 2, and 999.
+
+Verified every route returns 200 and renders its real content (not just a blank page): `/`, `/login`, `/register`, `/dashboard`, `/projects`, `/projects/1`, `/projects/2`, `/projects/999`, plus the real and fake public-project-slug cases above. Every form input has a matching `<label for>` (`login-email`/`login-password`, `register-name`/`register-email`/`register-password`), confirmed in the actual served HTML.
+
+Honest verification limit: curl cannot execute client-side JavaScript, so while the SSR-time fetches above are genuinely, fully verified end-to-end, the `/login`/`/register` forms' actual submit-button-click → `$fetch` path could only be verified by (a) confirming the exact request shape against the real, already-proven backend contract, (b) a clean typecheck of the fetch code, and (c) confirming the rendered form markup is correct - not by an actual interactive submission. No Playwright/browser-automation tooling exists in this repo yet (confirmed: not in `frontend/package.json`, not in `compose.test.yaml`), so this gap is real and stays open until a later testing module, not silently assumed away.
+
+**Step 7 - accessibility walkthrough**
+
+No live browser/screen-reader/DevTools accessibility-tree inspection was available in this environment - what follows is static verification (real served HTML, real served CSS, ARIA attributes checked against spec), not a literal browser accessibility-tree snapshot. Documenting that limitation honestly rather than implying a browser session happened.
+
+Checked heading hierarchy across every page by curling each one and extracting every `<h1>`-`<h6>` tag in document order. Found two real skips:
+
+1. `/dashboard` and `/projects`: `<h1>` → `<h3>` (`ProjectCard` used `h3` with nothing at `h2`). Fixed by changing `ProjectCard`'s title to `h2`, since every current usage places it directly under a page `h1` with no intervening section heading.
+2. `/projects/[id]`: `<h1>` → `<h2>Tasks</h2>` → `<h4>` (`TaskCard` used `h4`). Fixed by changing `TaskCard`'s title to `h3`.
+
+Re-curled all three pages after the fix and confirmed clean sequential hierarchy (`h1`→`h2`→`h3`, no skips) on all of them.
+
+Checked for the module's own named failure mode - clickable `div`/`span` elements without keyboard/role behavior: `grep`'d every `.vue` file under `app/` for `@click` and found exactly one, on `TaskCard`'s real `<button type="button">` elements. No clickable non-interactive elements exist anywhere in the app.
+
+Confirmed the focus-visible and skip-link CSS rules are genuinely present in the *served* stylesheet (not just written and assumed applied) by curling `/_nuxt/assets/css/main.css` directly and grepping for both rule blocks - both present. Confirmed every form input has a matching `<label for>` (Step 6). Confirmed error identification doesn't rely on color alone: `ErrorAlert` has `role="alert"` plus a text title and message; `StatusBadge` renders a human-readable text label, not a bare color swatch.
+
+**Step 8 - frontend quality gates**
+
+`package.json` had no `lint` script before this module (confirmed, matching `CLAUDE.md`'s own note). Added `@nuxt/eslint` + `eslint` as dev dependencies, registered the module in `nuxt.config.ts`, generated `eslint.config.mjs` via `withNuxt()`, and added a `lint` script.
+
+First real lint run caught a genuine error, not a clean pass on the first try:
+
+```text
+/workspace/app/components/Pagination.vue
+  1:1  error  Component name "Pagination" should always be multi-word  vue/multi-word-component-names
+✖ 1 problem (1 error, 0 warnings)
+```
+
+`vue/multi-word-component-names` exists to prevent collisions with current or future native/custom HTML elements. Fixed by renaming the component (and its one usage) to `PaginationControls.vue` - not by disabling the rule.
+
+Full gate, final state, all three commands run separately with exit codes captured correctly via `PIPESTATUS` (an earlier run in this session had piped through `tail` and silently discarded the real exit code in favor of `tail`'s own - caught and corrected before treating any run as authoritative):
+
+```text
+$ npm run lint          → exit 0, no errors
+$ npm run typecheck     → exit 0 ("Found 0 errors" per vue-tsc, aside from the benign volar warning)
+$ npm run build         → exit 0
+  ✔ Client built in 34435ms
+  ✔ Server built in 17763ms
+  [nitro] ✔ Generated public .output/public
+  [nitro] ✔ Nuxt Nitro server built
+```
+
+**Independent challenge - reusable pagination component**
+
+Implemented (not deferred to a design note) - well within scope for the remaining time and directly exercises typed props/events and accessibility patterns already established this module. Built `app/components/PaginationControls.vue`: controlled component (`v-model:currentPage`, `totalPages` prop), real `<button type="button">` Previous/Next controls (native keyboard support, no custom `tabindex`/keydown handling needed), an `aria-live="polite"` status region announcing "Page X of Y" to screen readers on every change, and boundary-disabled buttons (`currentPage <= 1` / `currentPage >= totalPages`).
+
+Checked `docs/api-contract.md` again specifically for this: the project/task list endpoints have no `page`/`limit` query parameters yet, so there is no real paginated list to attach this to - matching the module's own explicit allowance that it "may remain unused." Rather than leave it completely unverified, wired a clearly-commented, non-real demo instance into `/projects` (`demoPage`/`demoTotalPages = 3`, explicitly labeled as a demo in both a code comment and the page's own visible text) purely to prove it renders and its boundary logic actually works, not to imply real pagination exists. Verified via the real served HTML: initial state renders `Page 1 of 3` with `Previous` correctly `disabled` and `Next` enabled - the boundary-state logic is proven, not assumed. The Next-click increment itself is a client-side-only interaction and shares the same curl limitation noted in Step 6 for the login/register forms.
+
+Component test plan (no test runner exists in this project yet - `package.json` has no `test` script - so this is a written plan, not executable tests):
+
+1. Renders `Page {currentPage} of {totalPages}` from props.
+2. `currentPage <= 1` → Previous button has `disabled` attribute; `currentPage >= totalPages` → Next has `disabled`.
+3. Clicking an enabled Previous button emits `update:currentPage` with `currentPage - 1`.
+4. Clicking an enabled Next button emits `update:currentPage` with `currentPage + 1`.
+5. Clicking a disabled button emits nothing (relies on the native `disabled` attribute blocking the click, not manual guard logic in the handler alone).
+6. `nav[aria-label="Pagination"]` exists; the status paragraph has `role="status"` and `aria-live="polite"`.
+7. Both controls are real `<button>` elements reachable via Tab and activatable via Enter/Space with no custom keyboard handling.
+
+**A real environment limitation discovered this module**
+
+Vite's dev-server file watcher does not reliably pick up file changes through this Windows Docker bind mount - new/changed files written from the host did not trigger HMR, even though the bind mount itself had the correct, current content (confirmed by `docker exec ... cat`). Worked around by restarting the `frontend` container after each batch of edits before curling for verification, rather than trusting a live HMR session. Documented here rather than silently working around it without mention, matching the "make not installed" and other real environment-limitation entries from earlier modules.
+
+**Known, deliberate limitations carried forward to Module 11**
+
+- Header nav (`Dashboard`/`Projects`/`Log in`/`Sign up`) is static and not conditional on auth state - there is no session/store yet to condition it on.
+- `/login`/`/register` success does not persist the access token anywhere (no store, no cookie) - the next page load has no memory of it.
+- `/dashboard`, `/projects`, `/projects/[id]` use fixture data, not the real authenticated `GET /api/v1/projects`/`GET /api/v1/projects/{id}/tasks` calls.
+- `TaskCard`'s Advance/Delete on `/projects/[id]` mutate the page's local in-memory copy only - no real `PATCH`/`DELETE` request is sent.
+
+All four are explicit, expected consequences of this module's own stated boundary ("use temporary local data for authenticated pages if the API client is not yet wired"), not oversights - and all four are exactly what `workshop/11-frontend-api-integration-and-state.md` exists to close.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - the server/public runtime config split (why SSR and browser code need different API base URLs), typed API contracts mirroring backend schemas, separating presentational components (typed props, no data-fetching) from page-level data logic, route pages with explicit loading/success/empty/error states rather than assuming data always exists, and accessibility fundamentals (semantic landmarks, heading hierarchy, focus visibility, label association, not relying on color alone).
+- I can explain it without the reference code: yes - a TypeScript interface only checks code at compile time; it doesn't inspect what actually arrives over the network at runtime, so a backend response that violates the contract (wrong type, missing field) would still be trusted by TypeScript unless a runtime schema validator is added separately. SSR needed a different API base than the browser because the two run in genuinely different network environments - the Nuxt server process runs inside the Docker network and must use the internal service DNS name (backend), while a real browser has no way to resolve that hostname and must use a publicly reachable address (localhost or a real public URL). Relying on color alone for status/error meaning excludes color-blind users, screen reader users, and anyone with reduced vision - meaning should always also be conveyed through text, labels, or ARIA attributes, with color only reinforcing it.
+- I can diagnose one failure in this area: mostly yes - confident building a similar typed frontend foundation (runtime config, typed contracts, presentational components, route states, accessibility basics, pagination) for a different project, though I'd still reference Nuxt/Vue-specific framework APIs. Would be slower with advanced accessibility auditing, complex SSR caching strategies, and large-scale frontend state management.
+- Confidence from 1-5: 4.5/5 - found real integration bugs rather than assuming correctness (the SSR API-base mismatch, heading hierarchy skips), verified actual rendered output instead of trusting source code, made and documented deliberate scope decisions honestly, and correctly identified the limits of available verification tooling (curl cannot exercise client-side JavaScript). Held back from 5/5 because production-scale frontend work still requires more experience with larger applications, deeper accessibility auditing, and performance optimization beyond this module's scope.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
