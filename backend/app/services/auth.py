@@ -1,4 +1,5 @@
 """Authentication service operations."""
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 

@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-.PHONY: help setup validate up down logs ps backend-test frontend-test test clean
+.PHONY: help setup validate up down logs ps backend-test frontend-test test backend-quality clean
 
 help: ## Show commands
 	@awk 'BEGIN {FS = ":.*## "; printf "\nUsage: make <target>\n\n"} /^[a-zA-Z_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -32,6 +32,16 @@ frontend-test: ## Run Nuxt starter type checks
 	@docker compose run --rm frontend npm run typecheck
 
 test: backend-test frontend-test ## Run starter verification
+
+backend-quality: ## Run backend lint, format check, type check, and tests with coverage (the shared gate)
+	@echo "--- ruff check ---"
+	@docker compose run --rm backend ruff check .
+	@echo "--- ruff format --check ---"
+	@docker compose run --rm backend ruff format --check .
+	@echo "--- mypy ---"
+	@docker compose run --rm backend python -m mypy app
+	@echo "--- pytest (branch coverage, fail_under enforced via pyproject.toml) ---"
+	@docker compose run --rm backend python -m pytest --cov=app --cov-branch --cov-report=term-missing
 
 clean: ## Remove containers and the disposable database volume
 	@docker compose down -v --remove-orphans

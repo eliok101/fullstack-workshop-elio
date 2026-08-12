@@ -1,4 +1,5 @@
 """Integration tests for task routes, hitting the real FastAPI app via TestClient."""
+
 import uuid
 
 import pytest
@@ -27,21 +28,24 @@ client = TestClient(app)
 
 
 class AuthContext:
-    def __init__(self, token: str, email: str, created_project_ids: list[int]):
+    def __init__(
+        self,
+        token: str,
+        email: str,
+        created_project_ids: list[int],
+        extra_emails: list[str],
+    ):
         self.token = token
         self.email = email
         self.created_project_ids = created_project_ids
+        self.extra_emails = extra_emails
 
     @property
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
 
-@pytest.fixture(autouse=True)
-def auth_ctx():
-    email = f"test-user-{uuid.uuid4().hex}@example.com"
-    password = "TestPassword123!"
-
+def _register_and_login(email: str, password: str) -> str:
     register_response = client.post(
         "/api/v1/auth/register",
         json={"email": email, "full_name": "Test User", "password": password},
@@ -53,10 +57,27 @@ def auth_ctx():
         data={"username": email, "password": password},
     )
     assert login_response.status_code == 200, login_response.text
-    token = login_response.json()["access_token"]
+    return login_response.json()["access_token"]
+
+
+def _register_second_user(auth_ctx: "AuthContext") -> "AuthContext":
+    """Register a genuinely distinct second user, sharing cleanup with auth_ctx."""
+    email = f"test-stranger-{uuid.uuid4().hex}@example.com"
+    password = "StrangerPassword123!"
+    token = _register_and_login(email, password)
+    auth_ctx.extra_emails.append(email)
+    return AuthContext(token, email, auth_ctx.created_project_ids, [])
+
+
+@pytest.fixture(autouse=True)
+def auth_ctx():
+    email = f"test-user-{uuid.uuid4().hex}@example.com"
+    password = "TestPassword123!"
+    token = _register_and_login(email, password)
 
     created_project_ids: list[int] = []
-    ctx = AuthContext(token, email, created_project_ids)
+    extra_emails: list[str] = []
+    ctx = AuthContext(token, email, created_project_ids, extra_emails)
 
     yield ctx
 
@@ -67,6 +88,8 @@ def auth_ctx():
     )
     cleanup_db.execute(delete(Project).where(Project.id.in_(created_project_ids)))
     cleanup_db.execute(delete(User).where(User.email == email))
+    for extra_email in extra_emails:
+        cleanup_db.execute(delete(User).where(User.email == extra_email))
     cleanup_db.commit()
     cleanup_db.close()
 
@@ -227,3 +250,50 @@ def test_filter_no_matches_returns_empty_list(auth_ctx):
     )
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_stranger_cannot_update_task(auth_ctx):
+    project = _create_project(auth_ctx, "Stranger Update Project")
+    task = client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "Owner's Task"},
+        headers=auth_ctx.headers,
+    ).json()
+
+    stranger = _register_second_user(auth_ctx)
+    response = client.patch(
+        f"/api/v1/projects/{project['id']}/tasks/{task['id']}",
+        json={"status": "in_progress"},
+        headers=stranger.headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+    unchanged = client.get(
+        f"/api/v1/projects/{project['id']}/tasks/{task['id']}",
+        headers=auth_ctx.headers,
+    ).json()
+    assert unchanged["status"] == "backlog"
+
+
+def test_stranger_cannot_delete_task(auth_ctx):
+    project = _create_project(auth_ctx, "Stranger Delete Project")
+    task = client.post(
+        f"/api/v1/projects/{project['id']}/tasks",
+        json={"title": "Owner's Task"},
+        headers=auth_ctx.headers,
+    ).json()
+
+    stranger = _register_second_user(auth_ctx)
+    response = client.delete(
+        f"/api/v1/projects/{project['id']}/tasks/{task['id']}",
+        headers=stranger.headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["code"] == "not_found"
+
+    still_there = client.get(
+        f"/api/v1/projects/{project['id']}/tasks/{task['id']}",
+        headers=auth_ctx.headers,
+    )
+    assert still_there.status_code == 200

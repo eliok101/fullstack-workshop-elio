@@ -1,4 +1,5 @@
 """Integration tests for project routes, hitting the real FastAPI app via TestClient."""
+
 import uuid
 
 import pytest
@@ -27,21 +28,24 @@ client = TestClient(app)
 
 
 class AuthContext:
-    def __init__(self, token: str, email: str, created_project_ids: list[int]):
+    def __init__(
+        self,
+        token: str,
+        email: str,
+        created_project_ids: list[int],
+        extra_emails: list[str],
+    ):
         self.token = token
         self.email = email
         self.created_project_ids = created_project_ids
+        self.extra_emails = extra_emails
 
     @property
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
 
-@pytest.fixture(autouse=True)
-def auth_ctx():
-    email = f"test-user-{uuid.uuid4().hex}@example.com"
-    password = "TestPassword123!"
-
+def _register_and_login(email: str, password: str) -> str:
     register_response = client.post(
         "/api/v1/auth/register",
         json={"email": email, "full_name": "Test User", "password": password},
@@ -53,10 +57,27 @@ def auth_ctx():
         data={"username": email, "password": password},
     )
     assert login_response.status_code == 200, login_response.text
-    token = login_response.json()["access_token"]
+    return login_response.json()["access_token"]
+
+
+def _register_second_user(auth_ctx: "AuthContext") -> "AuthContext":
+    """Register a genuinely distinct second user, sharing cleanup with auth_ctx."""
+    email = f"test-stranger-{uuid.uuid4().hex}@example.com"
+    password = "StrangerPassword123!"
+    token = _register_and_login(email, password)
+    auth_ctx.extra_emails.append(email)
+    return AuthContext(token, email, auth_ctx.created_project_ids, [])
+
+
+@pytest.fixture(autouse=True)
+def auth_ctx():
+    email = f"test-user-{uuid.uuid4().hex}@example.com"
+    password = "TestPassword123!"
+    token = _register_and_login(email, password)
 
     created_project_ids: list[int] = []
-    ctx = AuthContext(token, email, created_project_ids)
+    extra_emails: list[str] = []
+    ctx = AuthContext(token, email, created_project_ids, extra_emails)
 
     yield ctx
 
@@ -67,6 +88,8 @@ def auth_ctx():
     )
     cleanup_db.execute(delete(Project).where(Project.id.in_(created_project_ids)))
     cleanup_db.execute(delete(User).where(User.email == email))
+    for extra_email in extra_emails:
+        cleanup_db.execute(delete(User).where(User.email == extra_email))
     cleanup_db.commit()
     cleanup_db.close()
 
@@ -136,3 +159,89 @@ def test_public_project_summary_excludes_private_fields(auth_ctx):
         "completed_task_count",
     }
     assert "owner_id" not in body
+
+
+def test_owner_can_update_project(auth_ctx):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Owner Update Test", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    project_id = create_response.json()["id"]
+    auth_ctx.created_project_ids.append(project_id)
+
+    patch_response = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"name": "Renamed By Owner"},
+        headers=auth_ctx.headers,
+    )
+    assert patch_response.status_code == 200
+    assert patch_response.json()["name"] == "Renamed By Owner"
+
+
+def test_owner_can_delete_project(auth_ctx):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Owner Delete Test", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    project_id = create_response.json()["id"]
+    auth_ctx.created_project_ids.append(project_id)
+
+    delete_response = client.delete(
+        f"/api/v1/projects/{project_id}", headers=auth_ctx.headers
+    )
+    assert delete_response.status_code == 204
+
+    get_response = client.get(
+        f"/api/v1/projects/{project_id}", headers=auth_ctx.headers
+    )
+    assert get_response.status_code == 404
+
+
+def test_non_owner_cannot_update_project(auth_ctx):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Not Yours To Edit", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    project_id = create_response.json()["id"]
+    auth_ctx.created_project_ids.append(project_id)
+
+    stranger = _register_second_user(auth_ctx)
+    patch_response = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"name": "Hijacked"},
+        headers=stranger.headers,
+    )
+    assert patch_response.status_code == 404
+    assert patch_response.json()["code"] == "not_found"
+
+    # Confirm the project genuinely wasn't modified.
+    get_response = client.get(
+        f"/api/v1/projects/{project_id}", headers=auth_ctx.headers
+    )
+    assert get_response.json()["name"] == "Not Yours To Edit"
+
+
+def test_non_owner_cannot_delete_project(auth_ctx):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Not Yours To Delete", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    project_id = create_response.json()["id"]
+    auth_ctx.created_project_ids.append(project_id)
+
+    stranger = _register_second_user(auth_ctx)
+    delete_response = client.delete(
+        f"/api/v1/projects/{project_id}", headers=stranger.headers
+    )
+    assert delete_response.status_code == 404
+    assert delete_response.json()["code"] == "not_found"
+
+    # Confirm the project genuinely still exists for its real owner.
+    get_response = client.get(
+        f"/api/v1/projects/{project_id}", headers=auth_ctx.headers
+    )
+    assert get_response.status_code == 200

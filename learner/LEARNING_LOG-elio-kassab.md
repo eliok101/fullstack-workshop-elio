@@ -1468,6 +1468,177 @@ Explicitly out of scope for this baseline (per the module's own stated boundary)
 
 ---
 
+### Module 09 — Backend testing and quality gates
+
+**Date and branch**
+
+- Date: 2026-08-11
+- Branch: learning/09-backend-quality
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Deliberately choose which layer (unit, API/integration, PostgreSQL-specific, or manual) each backend risk deserves rather than defaulting to one style of test everywhere; build fixtures that isolate state instead of depending on shared developer data or execution order; treat branch coverage as a diagnostic tool that reveals unexecuted code, not a target to be gamed; and assemble linting, type checking, tests, migration checks, and deliberate mutation drills into one reproducible quality gate.
+
+**Work completed so far**
+
+**Step 1 - test risk map**
+
+For each risk the module names, the layer it's actually tested at right now, and why:
+
+| Risk | Layer | Where | Why this layer |
+|---|---|---|---|
+| slug normalization | *Gap - only indirect* | `test_projects_api.py`, `test_transactions.py` | `slugify`/`generate_unique_slug` (`app/services/projects.py`) are pure-ish functions with a DB uniqueness check, but there is no direct unit test calling them with edge-case input (empty name, unicode, all-punctuation, collision counter). Coverage today comes only as a side effect of API/transaction tests that happen to create projects with ordinary names - a genuine "not every risk belongs in TestClient" gap I found by building this table, not one I closed this module. Noted honestly rather than padded over. |
+| task transition | Unit | `test_task_transitions.py::test_transition_matrix` | Pure function (`is_transition_allowed`), no DB/HTTP needed - a parametrized table over all 9 (current, requested) pairs is the lowest useful layer and the fastest to run. |
+| project creation transaction | Integration (session-level, below HTTP) | `test_transactions.py` | Needs a real DB session to prove commit/rollback atomicity, but not a full HTTP round trip - exercises the service/repository layer directly against a real session. |
+| request validation | API | `test_tasks_api.py::test_filter_invalid_status_returns_422`, `test_api.py::test_echo_invalid_schema_returns_422` | This is specifically about FastAPI/Pydantic request parsing behavior (422 shape), which only exists at the HTTP boundary - TestClient is the right layer. |
+| duplicate registration | API + service (mock) | `test_auth_security.py::test_duplicate_registration_returns_409` (pre-check path), `::test_registration_race_condition_returns_409_not_500` (added this module - `IntegrityError` path) | The pre-check is naturally an API-level 409 assertion; the race condition specifically requires forcing the pre-check to lie (via `unittest.mock.patch`) so the `IntegrityError` fallback path executes - unreachable through real concurrent HTTP calls in a single-threaded test process. |
+| cross-user authorization | API | `test_projects_api.py`, `test_tasks_api.py` (both extended this module with a genuine second registered user) | Authorization is a contract about what an authenticated *stranger* can and can't do through the real API surface - needs two real users and real Bearer tokens, not mocks. |
+| migration from empty PostgreSQL | Alembic CLI, not pytest | `alembic upgrade head` / `current` / `check` against the real Compose Postgres | Not a code-level risk at all - it's "does the migration chain actually build a working schema from nothing," which only a real database engine can answer. |
+| PostgreSQL constraint behavior | PostgreSQL-specific, isolated | `test_postgres_constraints.py` (new this module - independent challenge) | Native ENUM rejection is invisible to SQLite (bare TEXT column, no enforcement) - needs the real engine, raw SQL, isolated from the fast unit suite since its cost/purpose are both different. |
+| production startup/readiness | API | `test_health.py` (pre-existing) | `/health/live` and `/health/ready` are themselves the production readiness contract - TestClient against the real FastAPI app *is* the correct layer, not a mismatch. |
+
+**Step 2 - isolated fixtures**
+
+Reviewed the existing fixture pattern (established Module 07-08, extended this module): every API test file overrides `get_db` via `app.dependency_overrides`, generates a unique `uuid4()`-suffixed email per test run (never a fixed/shared test user), and explicit teardown deletes exactly the rows created during that test (`created_project_ids`, now also `extra_emails` for the second-user pattern added this module). No test reads `.env` production values or depends on execution order - confirmed by running `test_projects_api.py` and `test_tasks_api.py` in isolation and combined, same pass count either way.
+
+**Step 3 and 4 - strengthening unit and API tests, closing coverage gaps**
+
+Added `pytest-cov==6.0.0` to `backend/pyproject.toml`'s dev dependencies and rebuilt. First full coverage run surfaced three real, non-trivial gaps (reviewed by hand, prioritizing security/business-logic code over trivial lines, per the instruction not to pad for a number):
+
+1. **`PATCH`/`DELETE /projects/{id}` had zero tests.** Writing a real test for this (`test_owner_can_delete_project`) surfaced a genuine, previously-undetected production bug, not just a coverage gap: `Project` had no relationship/cascade to `ProjectMember`, so deleting any project with a membership row raised `ForeignKeyViolation` on `project_members_project_id_fkey`. This had been broken since Module 07 and was undetected because test cleanup always used raw SQL deletes (bypassing the ORM cascade path) and no manual walkthrough had exercised the real DELETE endpoint on a project with a membership row. Fixed in `backend/app/db/models.py` by adding `members: Mapped[list["ProjectMember"]] = relationship(back_populates="project", cascade="all, delete-orphan")` on `Project` and `project: Mapped["Project"] = relationship(back_populates="members")` on `ProjectMember`. Confirmed pure ORM-level fix via `alembic check` -> `No new upgrade operations detected` (no schema drift). Added `test_owner_can_update_project`, `test_owner_can_delete_project`, `test_non_owner_cannot_update_project`, `test_non_owner_cannot_delete_project` to `test_projects_api.py`, which required extending its `AuthContext`/fixture with a genuine second registered user (`_register_and_login`/`_register_second_user`) rather than reusing the single-user pattern.
+
+2. **Registration race condition (TOCTOU) had no automated test**, only the manual timing-style verification described in Module 08's log. Added `test_registration_race_condition_returns_409_not_500` to `test_auth_security.py`: inserts a user directly via the DB session, then patches `app.services.auth.get_user_by_email` to return `None` (deterministically simulating the exact race the pre-check can't see), and asserts the real endpoint still returns 409 (not an unhandled 500) via the `IntegrityError` fallback added in Module 08.
+
+3. **`decode_token`'s missing/invalid `sub` claim paths had no direct test.** Added `test_decode_token_rejects_missing_subject_claim` and `test_decode_token_rejects_non_numeric_subject_claim` to `test_auth_security.py`, each hand-crafting a validly-signed JWT (via `jwt.encode` with the real settings secret) that omits or corrupts the `sub` claim, asserting `decode_token` raises `InvalidTokenError` rather than crashing on `int(payload["sub"])`.
+
+**Step 5 - migrations against PostgreSQL**
+
+```text
+$ docker compose run --rm backend alembic current
+4840454901bd (head)
+
+$ docker compose run --rm backend alembic upgrade head
+(no output - already at head)
+
+$ docker compose run --rm backend alembic check
+No new upgrade operations detected.
+```
+
+Confirmed at head with zero drift, including after the `Project.members` relationship fix above (a pure ORM-level change, no new migration required).
+
+**Step 6 and 7 - static quality and coverage, final run**
+
+Pre-existing blocker found: a `ruff F401` (unused import) in an already-applied migration file, previously left deliberately unfixed across Modules 06-08 since editing an applied migration was judged riskier than the lint noise. Once building a real, always-enforced gate, an unfixable-by-policy lint error would mean the gate could never pass. Fixed via `extend-exclude = ["migrations/versions"]` in `backend/pyproject.toml`'s `[tool.ruff]` section rather than editing the migration file - more sustainable than a one-off fix since it also covers any future autogenerated migration, and doesn't touch applied migration content.
+
+Also found 10 files (all written in Module 08 or this module) that had never been run through `ruff format`; fixed via `docker compose run --rm backend ruff format .`.
+
+Full gate, run end-to-end after all fixes above:
+
+```text
+--- ruff check ---
+All checks passed!
+
+--- ruff format --check ---
+44 files already formatted
+
+--- mypy ---
+Success: no issues found in 34 source files
+
+--- pytest (branch coverage) ---
+......................................................                   [100%]
+---------- coverage: platform linux, python 3.13.5-final-0 -----------
+Name                               Stmts   Miss Branch BrPart  Cover   Missing
+------------------------------------------------------------------------------
+app/api/deps.py                       17      1      2      1    89%   29
+app/api/routes/auth.py                49     15      4      0    64%   65-78, 86-87, 92
+app/api/routes/health.py              21      4      2      0    83%   11-14
+app/core/config.py                    25      1      2      1    93%   32
+app/db/session.py                     19      2      0      0    89%   26-27
+app/repositories/tasks.py             14      1      4      1    89%   18, 32->34
+app/services/projects.py              48      3     12      3    90%   69, 79, 86
+app/services/tasks.py                 36      1      8      1    95%   73->81, 89
+(all other files 100%)
+------------------------------------------------------------------------------
+TOTAL                                610     28     44      7    94%
+
+Required test coverage of 90.0% reached. Total coverage: 94.04%
+54 passed, 1 warning in 35.44s
+```
+
+Reviewed the remaining misses rather than chasing 100%: `auth.py` routes' 64% is almost entirely `refresh`/`logout` cookie-handling branches already proven correct via Module 08's manual live walkthrough but not re-encoded as automated tests (a real, acknowledged remaining gap, not hidden); `health.py`'s missing lines are the `/health` combined-endpoint's DB-down branch, exercised by a dependency override elsewhere but not counted against this specific route file; `config.py` line 32 and `db/session.py` 26-27 are defensive `except`/fallback branches for conditions not reachable in the test environment (e.g. a config value that's always set in `.env.example`). None of these were padded with empty assertions - left as documented, understood gaps below the 90% floor.
+
+Configured the floor itself in `[tool.coverage.report]`: `fail_under = 90`. Set below the current genuine 94.04% (not equal to it) deliberately, so the gate catches real regressions - a deleted test, an unguarded new branch - without being so tight that ordinary future module work trips it accidentally.
+
+Assembled the whole gate as `make backend-quality` in the `Makefile` (ruff check -> ruff format --check -> mypy -> pytest with branch coverage, each step echoed and run via `docker compose run --rm backend`, container is the shared gate per the module's own instruction). Real environment limitation: `make` itself is not installed in this Windows environment (confirmed absent under both Git Bash and PowerShell) - documented the exact command chain as the host-runnable equivalent rather than hiding the limitation, since the file/target is still the source of truth once `make` is available (e.g. CI, WSL, or after installing it).
+
+**Step 8 - mutation drill**
+
+Ran all three named mutations, recorded which tests failed, restored each, then closed the one real gap found.
+
+*Mutation 1 - allow `backlog -> done` directly* (`app/services/task_transitions.py`, added `TaskStatus.DONE` to the `BACKLOG` transition set):
+
+```text
+FAILED tests/test_task_transitions.py::test_transition_matrix[backlog-done-False]
+FAILED tests/test_tasks_api.py::test_invalid_direct_transition_returns_409 - assert 200 == 409
+2 failed, 17 passed
+```
+
+Caught at both the unit layer (the parametrized transition matrix) and the API layer (the 409 integration test) - exactly the intended defense-in-depth. Restored; confirmed clean via `git diff` (no changes) afterward.
+
+*Mutation 2 - remove project access check from task update* (`app/services/tasks.py`'s `update_task`, replaced `get_task_or_404(db, project_id, task_id, user_id)` with a direct `get_task_by_id_and_project` lookup that never checks `user_id`):
+
+First run - **survived undetected**: all 16 then-existing tests across `test_tasks_api.py` and `test_projects_api.py` passed with the authorization check completely bypassed. This is exactly Module 08's own named common failure mode ("checking project access for reads but not nested task updates/deletes"), now proven concretely present rather than theoretical. Per the module's instruction ("any mutation that survives reveals a missing or weak test; add one"), added `test_stranger_cannot_update_task` and `test_stranger_cannot_delete_task` to `test_tasks_api.py` (using the same second-user pattern added to `test_projects_api.py` in Step 3/4): create a task as the owner, then attempt PATCH/DELETE as a genuinely distinct second registered user, asserting 404/`not_found` and that the task is actually unchanged/still present.
+
+Confirmed against clean code first - `10 passed` including both new tests. Then re-applied the same mutation:
+
+```text
+FAILED tests/test_tasks_api.py::test_stranger_cannot_update_task - assert 200 == 404
+1 failed, 9 passed
+```
+
+Now caught. Restored; confirmed clean via `git diff` (no changes) and a final rerun (`10 passed`).
+
+*Mutation 3 - change project-create status from 201 to 200* (`app/api/routes/projects.py`'s `create_project` route):
+
+```text
+FAILED tests/test_projects_api.py::test_create_and_get_project - assert 200 == 201
+FAILED tests/test_tasks_api.py::test_create_task_and_get_it - assert 200 == 201
+(9 more FAILED, 11 failed, 7 passed, 11 errors total)
+```
+
+Caught immediately and broadly - nearly every test that creates a project does so through the shared `_create_project` helper, which asserts `status_code == 201` before proceeding, so a huge fraction of the suite fails together rather than one narrow test. No gap here; the 201 contract is already over-defended, if anything. Restored the route.
+
+Post-mutation cleanup note: the mutation-3 run left one orphaned project (`api-test-project`, created before its own assertion failed, so it was never added to the fixture's cleanup list) and its owner user in the database. Found and removed manually via a one-off script querying for the leftover slug, then reran the full suite clean (`18 passed` for `test_projects_api.py` + `test_tasks_api.py` together) to confirm no residual pollution.
+
+**Step 9 - backend quality command**
+
+`make backend-quality` defined in the `Makefile` as described in Step 6/7 above. Verified by running its exact command sequence directly (since `make` isn't installed locally) - full clean pass reproduced immediately above.
+
+**Independent challenge - PostgreSQL-backed constraint test**
+
+Implemented (not deferred to a design note) - reasonably scoped, and the module explicitly asks for exactly this kind of test. Created `backend/tests/test_postgres_constraints.py`, isolated from the fast unit suite per the module's requirement, with a module docstring explaining why: `TaskStatus`/`TaskPriority` are backed by native PostgreSQL ENUM types (Module 06), which SQLite has no equivalent for - a SQLite "enum" column is really just unenforced TEXT. Two tests bypass the ORM/Pydantic entirely via raw SQL (`INSERT INTO tasks ... VALUES ('not_a_real_status', ...)`) to prove PostgreSQL itself, not just application-level validation, rejects an invalid enum value.
+
+Self-caught bug while writing it: the first version used lowercase `'backlog'`/`'medium'` for the *valid* column value in each test (proving the *other* column's constraint), which are themselves invalid against the real stored enum - SQLAlchemy persists the Python enum's `.name` (uppercase `BACKLOG`), not `.value` (lowercase `backlog`), a fact re-discovered from Module 06. This produced a confusing failure blaming the wrong enum. Fixed by using the correct uppercase literals (`'BACKLOG'`, `'MEDIUM'`) for the valid column in each test. Verified both tests pass in isolation and together after the fix.
+
+**Full suite, final state**
+
+```text
+54 passed, 1 warning in 35.44s
+Required test coverage of 90.0% reached. Total coverage: 94.04%
+```
+
+All three mutation-drill files (`app/services/tasks.py`, `app/services/task_transitions.py`, `app/api/routes/projects.py`) confirmed restored to their committed state via `git diff` (no output on any of the three).
+
+**Self-rating**
+
+- I can repeat this with notes: yes - coverage analysis (a guide, not a goal; setting a realistic floor below the current genuine percentage rather than locking it exactly), risk mapping prioritized by impact (auth, authorization, transactions, constraints, state transitions) not code size, mutation testing (introduce a defect, verify tests fail, treat survival as a real gap to close, not just a result to record), and isolating database-engine-specific tests from the portable unit suite.
+- I can explain it without the reference code: yes - a killed mutation confirms existing protection works; a surviving mutation is more informative because it answers a harder question - what important behavior could break right now with zero tests noticing - revealing a genuine blind spot rather than a theoretical one. Coverage percentage alone only proves code executed, not that the test verified correct behavior, output, state, or failure handling - a test with an assert True after calling a function would show 100% coverage while proving almost nothing; mutation testing complements coverage by directly checking whether tests would actually catch a real behavioral break.
+- I can diagnose one failure in this area: mostly yes - confident designing a similar quality gate (linting, formatting, coverage threshold, mutation testing or equivalent, database-specific integration tests, honest documentation of environment limitations) for a different backend framework, understanding the underlying principles are framework-independent even though I'd need to learn framework-specific tooling.
+- Confidence from 1-5: 5/5 for this module - genuinely engaged with and verified the real results as they happened (the mutation drill's actual pass/fail output, the coverage tradeoffs, the killed-vs-surviving distinction), understanding not just that the tools ran but what they were actually measuring and why a surviving mutation matters more than a passing test count.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
