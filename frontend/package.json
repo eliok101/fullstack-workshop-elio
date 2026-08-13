@@ -7,6 +7,7 @@
     "dev": "nuxt dev --host 0.0.0.0 --port 3000",
     "build": "nuxt build",
     "typecheck": "nuxt typecheck",
+    "lint": "eslint .",
     "postinstall": "nuxt prepare"
   },
   "dependencies": {
@@ -15,7 +16,9 @@
     "vue-router": "4.6.4"
   },
   "devDependencies": {
+    "@nuxt/eslint": "^1.17.0",
     "@types/node": "22.20.1",
+    "eslint": "^10.8.1",
     "typescript": "5.9.3",
     "vue-tsc": "3.2.5"
   },
