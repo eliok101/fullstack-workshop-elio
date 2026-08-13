@@ -1791,6 +1791,107 @@ All four are explicit, expected consequences of this module's own stated boundar
 
 ---
 
+### Module 11 — Frontend API integration and state
+
+**Date and branch**
+
+- Date: 2026-08-13
+- Branch: learning/11-frontend-api
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Replace every piece of Module 10's temporary scaffolding with the real thing: one typed API client that owns the runtime base URL, bearer-token attachment, a single shared refresh-and-retry on an expired access token, and normalized error output, instead of each page making its own raw `$fetch` call. A shared, reactive auth store (current user, in-memory access token, an explicit initializing/authenticated/unauthenticated state machine) that a client-only plugin populates on load by attempting a silent refresh against the Module 08 httpOnly refresh cookie. Route middleware that keeps `/dashboard` and `/projects*` unreachable while unauthenticated, without looping against `/login`. `login.vue`/`register.vue` and `AppHeader.vue` wired to that real state instead of the local-only success message and static nav Module 10 documented as a known gap. `/dashboard`, `/projects`, and `/projects/[id]` calling the real `GET`/`POST`/`PATCH`/`DELETE` endpoints instead of `app/fixtures/placeholder-data.ts`, including `TaskCard`'s Advance/Delete actually mutating backend state. Deliberate failure drills (expired token, network failure, 403/404) with real recorded behavior, not assumed behavior.
+
+**Scope decision made up front**
+
+Module 10 documented four explicit, deliberate gaps it left for this module: static header nav, no token persistence after login/register, fixture data on `/dashboard`/`/projects`/`/projects/[id]`, and `TaskCard` mutating only local state. All four are this module's job and are closed below. Per the module text ("keeping private pages client-authenticated in the baseline" / "Avoid server/client hydration mismatch"), authenticated data fetching for `/dashboard`, `/projects`, and `/projects/[id]` is client-only (`server: false`) - the SSR pass renders only the loading shell for those routes (no real data, so no leak), and the client takes over once the auth store has resolved after hydration. `/public/projects/[slug]` keeps its Module-10 SSR `useFetch` unchanged since it is genuinely unauthenticated.
+
+**State-management choice**
+
+Checked before assuming: `frontend/package.json` has no state-management library today (`pinia` only appears in `package-lock.json` as another package's peer-dependency range, not an installed dependency - confirmed via `grep -n '"node_modules/pinia"' package-lock.json`, zero matches). This project's own docs already name the intended choice: `docs/architecture.md`'s frontend layering diagram draws `Page --> Store[Pinia auth store]`, and `AGENTS.md` states "shared authenticated state belongs in Pinia only when necessary" - auth is exactly that case (shared across header, middleware, and every protected page), project/task data stays page-local per that same rule. So: added `pinia` + `@pinia/nuxt` as new dependencies this module, rather than reaching for Nuxt's built-in `useState` or inventing a third approach the project's own architecture doc doesn't mention.
+
+**Backend contract checked before wiring**
+
+Read `backend/app/api/routes/auth.py` and `docs/api-contract.md` directly rather than assuming cookie/header behavior: the refresh token is an `httponly`, `samesite=lax` cookie named `refresh_token`, scoped to path `/api/v1/auth`, set by `/auth/login` and read by `/auth/refresh`; `/auth/logout` deletes it server-side. `backend/app/main.py` configures CORS with `allow_credentials=True` against the explicit origin `http://localhost:3000` (not a wildcard - required for credentialed cross-origin cookies to work at all), which means every frontend request that needs the cookie must set `credentials: 'include'` explicitly, since that is not `$fetch`'s default for cross-origin requests.
+
+**Work completed so far**
+
+**Step 1 - state management decision**
+
+Checked whether Pinia was already installed (it wasn't) before assuming a state-management approach. Confirmed via `AGENTS.md` and `docs/architecture.md` that Pinia is this project's own documented choice for shared authenticated state ("shared authenticated state belongs in Pinia only when necessary"), not an outside assumption. Added `pinia` + `@pinia/nuxt` as new dependencies.
+
+**Step 2 - API client**
+
+Built `frontend/app/utils/api-client.ts`: a single typed client factory with per-request baseURL resolution, Bearer token attachment, `credentials:'include'` on every call (required since the refresh cookie is httponly/samesite=lax scoped to `/api/v1/auth` per Module 08), a single shared in-flight refresh promise so concurrent 401s trigger exactly one refresh (not one per failed request), a retry cap of one, and an `ApiError` class normalizing the backend's `{detail, code}` shape alongside 422 validation errors and null-status network failures.
+
+**Step 3 - auth store and safe init**
+
+Built `frontend/app/stores/auth.ts` (Pinia): `user`, `accessToken` (in-memory only, never persisted to storage), and `status` (initializing/authenticated/unauthenticated). `rawRefresh` deliberately uses a raw `$fetch` call outside the shared `$api` client specifically to avoid the refresh mechanism calling itself recursively. `logout` clears local state even if the network call fails, with a `console.warn` so a failed logout call is visible rather than silently swallowed. `frontend/app/plugins/auth.client.ts` (`.client`-suffixed, never runs during SSR) calls `initAuth()` once on app load to attempt a silent refresh against the httpOnly cookie - this is how a page reload knows whether a session already exists.
+
+**Step 4 - route protection middleware**
+
+Built `frontend/app/middleware/auth.global.ts`: returns immediately during SSR (no SSR-authenticated fetch in this baseline), and on the client always awaits `initAuth()` completing before making any redirect decision - preventing a redirect based on a not-yet-known auth state. Protects `/dashboard` and `/projects*`, redirecting unauthenticated visitors to `/login?redirect=<path>`; redirects already-authenticated visitors away from `/login` and `/register`.
+
+**Step 5 - login/register wiring and conditional nav**
+
+Rewired `login.vue` and `register.vue` to use `auth.login()`/`auth.register()` instead of Module 10's raw `$fetch` calls. `AppHeader.vue`'s nav is now genuinely conditional on `auth.isAuthenticated` (Dashboard/Projects/Log out vs. Log in/Sign up) - closing the static-nav gap Module 10 explicitly documented as deferred.
+
+**Step 6 - real project/task pages, placeholder data removed**
+
+`dashboard.vue` and `projects/index.vue` now call the real `GET /api/v1/projects` endpoint via `useProjectsApi.ts` (a new composable centralizing every project/task request shape). `projects/index.vue` also gained a real create-project form. `projects/[id].vue` rewritten around a manual `AbortController`-backed loader (see independent challenge) with real GET project + GET tasks, POST task, PATCH task status (Advance), and DELETE task (Delete) - replacing Module 10's local-only mutations. Deleted `frontend/app/fixtures/placeholder-data.ts` entirely, confirmed via grep that nothing referenced it before deletion.
+
+**Real bug #1 - false "empty" state during SSR**
+
+curl on `/dashboard` showed "You don't have any projects yet" for every visitor, authenticated or not - not because there were zero projects, but because `useAsyncData(..., {server:false})` never runs the fetcher during SSR, leaving `status: 'idle'` (not `'pending'`) at render time. The template's `v-else-if` chain treated "haven't checked yet" identically to "checked and got zero results." Confirmed the real status type (`AsyncDataRequestStatus = 'idle' | 'pending' | 'success' | 'error'`) directly from Nuxt's own type definitions rather than guessing. Fixed by changing the loading condition to `v-if="pending || status === 'idle'"` in both `dashboard.vue` and `projects/index.vue`. Re-verified via curl: the false-empty text no longer appears; the loading indicator (`role="status"`) renders instead.
+
+**Step 7 - failure drills, all against the real running backend**
+
+| Drill | Result |
+|---|---|
+| Invalid access token | 401, "Could not validate credentials" |
+| No token | 401, "Not authenticated" |
+| Refresh with no cookie | 401, "No refresh token provided" |
+| Refresh with a garbage cookie | 401, "Invalid or expired refresh token" |
+| Real network failure (`docker compose stop backend`, not simulated) | curl exit 7 (connection refused); dashboard SSR still returned 200 since the client-only-fetch design means the page shell never depends on backend availability |
+| Nonexistent project | 404, "Project 999999 not found", code: not_found |
+| Invalid transition (backlog -> done) | 409, code: invalid_transition |
+| Cross-user access to a private project (GET and DELETE) | 404, not 403 - confirmed the resource-scoped-404 design from Module 07/08 still holds through this new client layer, using a genuine second registered user |
+| The legal path (advance then delete) | 200 then 204, re-fetched the task list afterward to confirm exactly one task remained - the deletion was real, not assumed |
+
+**Real bug #2 - production build ELOOP, an accumulated-state problem, not a code bug**
+
+`npm run build` failed with `ELOOP: too many symbolic links`, a genuinely circular (not just deep) chain under `node_modules/@vue/server-renderer`. Diagnosed as accumulated state in the frontend `node_modules` Docker named volume, built up across many incremental `npm install` runs since Module 00 - not caused by this session's changes. Confirmed via a clean reinstall: `rm -rf node_modules/*` then `npm install` added 185 packages (vs. 14 for the original incremental add earlier this session), confirming this was corrupted accumulated state, not a single bad dependency. Rebuild succeeded cleanly afterward.
+
+**Step 8 - quality gate, final authoritative run**
+
+`npm run lint` -> exit 0 (after fixing a real error: `@typescript-eslint/no-invalid-void-type` on an explicit `<void>` generic in `useProjectsApi.ts`'s `deleteTask` call - removed the redundant generic rather than disabling the rule, relying on the client's own default instead).
+`npm run typecheck` -> exit 0 (after fixing two real TypeScript errors: `ApiRequestInit.body` needed widening to `unknown` since a single static type can't express both a typed request-body interface and login's `URLSearchParams`; and the client's internal `$fetch<T>()` generic usage was replaced with an untyped call plus a single `as T` cast, since ofetch's generic overload ties response type to the literal request path in a way that conflicted with an arbitrary caller-supplied `T`).
+`npm run build` -> exit 0, 46MB total (12MB gzip).
+
+**Independent challenge - AbortController-based cancellation**
+
+Implemented for real (not a design note). The race it prevents: `/projects/[id]` reuses the same Vue component instance across `:id` param changes (Vue Router doesn't remount just because the param changed), so navigating from `/projects/1` to `/projects/2` before project 1's fetch resolves leaves that request in flight - without cancellation, a slow response for project 1 arriving after project 2's fetch completes would silently overwrite the now-current page with the wrong project's data. Mechanism: `loadProject(id)` aborts any previous in-flight controller before starting a new one; both the success and catch paths check `controller.signal.aborted` before writing to reactive state, so a genuinely cancelled request can never write stale data - this cancels the actual underlying network request via the abort signal, not a weaker last-write-wins timestamp guard.
+
+**Verification gap, explicitly flagged rather than assumed**
+
+No browser automation was available this session (Claude in Chrome was considered but not set up). Every client-JS-only interaction (login/register redirect, conditional nav re-render, middleware redirects, TaskCard button clicks, silent-refresh persistence across a hard reload) was verified as far as possible without a real browser: the exact request/response contract each handler constructs was independently reproduced byte-for-byte via curl against real created data, the SSR shell was confirmed to leak no protected data pre-hydration, and the reactive bindings/event handlers were read directly in source - but the actual click-triggered DOM behavior in a real browser was not observed. Documented honestly as the same class of limitation Module 10 hit with curl-not-executing-client-JS, not claimed as fully verified.
+
+**Known, deliberate limitations carried forward / found this module**
+
+- `npm test` still doesn't exist - no test runner in this project (unchanged gap from Module 10).
+- Refresh tokens are still not rotated and there's no server-side revocation list (unchanged `docs/security.md` limitation, out of scope for this module).
+- Test data created this session (users 395/396, projects 393/394 and their tasks) was left in the shared dev database rather than cleaned up, unlike most prior modules' test fixtures which used dedicated teardown. Noted honestly rather than silently left inconsistent with the rest of the workshop's practice.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - the shared typed API client (Bearer attachment, credentials handling, single in-flight refresh promise), the Pinia auth store and silent-refresh init flow, global route protection middleware, wiring real backend calls to replace placeholder data across dashboard/projects/project-detail, and the AbortController cancellation pattern for stale route-data responses.
+- I can explain it without the reference code: yes - refresh logic must live outside the shared API client because the client's own 401 handler is what triggers a refresh; if refresh used that same client and itself received a 401, it would recursively invoke its own recovery logic. Middleware must await initAuth() completing before making any redirect decision because the initial auth state is genuinely unknown during a silent refresh - redirecting before that resolves risks sending a valid, already-logged-in returning user to the login page. AbortController prevents a stale response from an old route (e.g. project 1) from overwriting the state for a newly navigated-to route (project 2) if responses arrive out of order, since Vue Router reuses the same component instance across param changes rather than remounting it.
+- I can diagnose one failure in this area: yes - the module's own two real bugs (the SSR false-empty state, the accumulated node_modules ELOOP corruption) were independently diagnosed and fixed with root-cause evidence, not guessed at, demonstrating the ability to adapt this pattern to a different API, route structure, auth contract, and state model on another project.
+- Confidence from 1-5: 5/5 - the implementation, real backend integration (verified against a live server including deliberate failure drills - invalid tokens, a real backend outage, cross-user authorization, invalid transitions), and the full quality gate (lint/typecheck/build) were all thoroughly and empirically verified. The one caveat is that browser-only click-triggered interactions were not observed via browser automation (no such tooling was available this session) - verified instead via byte-for-byte request/response contract reproduction and direct source review, honestly documented as a real limitation rather than claimed as fully verified.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
