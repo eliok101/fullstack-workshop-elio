@@ -1,8 +1,8 @@
 <script setup lang="ts">
-// Real backend call, not placeholder data: GET /api/v1/projects/public/{slug}
-// requires no authentication (see docs/api-contract.md), so there's no
-// session-persistence gap blocking wiring it for real - unlike /dashboard
-// and /projects, which need Module 11's auth store first.
+// GET /api/v1/projects/public/{slug} requires no authentication (see
+// docs/api-contract.md), so unlike /dashboard and /projects this page keeps
+// its SSR fetch instead of going through the auth-gated $api client -
+// there's no session to wait on.
 //
 // This page renders during SSR, so it must use the private apiInternalBase
 // (Docker DNS `backend:8000`) when running server-side and the public

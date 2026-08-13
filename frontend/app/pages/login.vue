@@ -1,27 +1,23 @@
 <script setup lang="ts">
-const config = useRuntimeConfig()
+const auth = useAuthStore()
+const route = useRoute()
 
 const email = ref('')
 const password = ref('')
 const status = ref<'idle' | 'pending' | 'success' | 'error'>('idle')
 const errorMessage = ref('')
-const accessToken = ref('')
 
 async function handleSubmit() {
   status.value = 'pending'
   errorMessage.value = ''
   try {
-    const body = new URLSearchParams({ username: email.value, password: password.value })
-    const response = await $fetch<AuthTokenResponse>(`${config.public.apiBase}/auth/login`, {
-      method: 'POST',
-      body,
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    })
-    accessToken.value = response.access_token
+    await auth.login(email.value, password.value)
     status.value = 'success'
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard'
+    await navigateTo(redirect)
   } catch (err) {
     status.value = 'error'
-    errorMessage.value = extractErrorDetail(err, 'Login failed. Check your email and password.')
+    errorMessage.value = err instanceof Error ? err.message : 'Login failed. Check your email and password.'
   }
 }
 
@@ -59,10 +55,6 @@ useSeoMeta({ title: 'Log in — Workboard' })
 
     <LoadingIndicator v-if="status === 'pending'" label="Signing you in…" />
     <ErrorAlert v-else-if="status === 'error'" :message="errorMessage" title="Login failed" />
-    <p v-else-if="status === 'success'" class="success">
-      Logged in against the real backend. Access token received (first 12 characters:
-      {{ accessToken.slice(0, 12) }}…). Session persistence isn't wired yet - Module 11
-      adds the auth store that keeps you signed in across pages.
-    </p>
+    <p v-else-if="status === 'success'" class="success">Logged in - redirecting…</p>
   </div>
 </template>

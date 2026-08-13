@@ -1,15 +1,17 @@
 <script setup lang="ts">
-// Placeholder data pending Module 11's real auth/session + API composable
-// layer - see frontend/app/fixtures/placeholder-data.ts. useAsyncData is
-// used (rather than a hardcoded ref) so this page already exercises Nuxt's
-// real loading/error/success async-state primitive, the same one a real
-// fetch will use once the API client exists.
-import { placeholderProjects } from '~/fixtures/placeholder-data'
+// Real backend call: GET /api/v1/projects, authenticated via the $api
+// client's bearer attachment. server: false because this route is
+// client-authenticated only in the baseline (see middleware/auth.global.ts
+// and app/plugins/auth.client.ts) - the SSR pass renders only the loading
+// state below, never real data, so there's nothing to leak to an
+// unauthenticated request.
+const api = useProjectsApi()
 
-const { data: projects, pending, error } = await useAsyncData('dashboard-projects', async () => {
-  await new Promise((resolve) => setTimeout(resolve, 300))
-  return placeholderProjects
-})
+const { data: projects, pending, status, error } = await useAsyncData(
+  'dashboard-projects',
+  () => api.listProjects(),
+  { server: false }
+)
 
 useSeoMeta({ title: 'Dashboard — Workboard' })
 </script>
@@ -17,12 +19,16 @@ useSeoMeta({ title: 'Dashboard — Workboard' })
 <template>
   <div>
     <h1>Your projects</h1>
-    <p class="page-note">
-      Placeholder data - not yet backed by a real session. Module 11 replaces this
-      with the authenticated <code>GET /api/v1/projects</code> call.
-    </p>
 
-    <LoadingIndicator v-if="pending" label="Loading your projects…" />
+    <!--
+      status === 'idle' matters as much as pending here: with server: false,
+      the SSR pass never starts the fetch at all, so pending is false and
+      status is 'idle' at that point - not "loaded and empty." Checking
+      pending alone was a real bug (fixed after curling this page and
+      finding "You don't have any projects yet" rendered for every visitor,
+      logged in or not, before the real request had even been sent).
+    -->
+    <LoadingIndicator v-if="pending || status === 'idle'" label="Loading your projects…" />
     <ErrorAlert v-else-if="error" :message="error.message" title="Could not load projects" />
     <p v-else-if="!projects || projects.length === 0">You don't have any projects yet.</p>
     <div v-else class="card-grid">

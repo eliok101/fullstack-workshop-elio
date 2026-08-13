@@ -1,5 +1,5 @@
 <script setup lang="ts">
-const config = useRuntimeConfig()
+const auth = useAuthStore()
 
 const email = ref('')
 const fullName = ref('')
@@ -12,20 +12,12 @@ async function handleSubmit() {
   status.value = 'pending'
   errorMessage.value = ''
   try {
-    const payload: UserRegisterRequest = {
-      email: email.value,
-      full_name: fullName.value,
-      password: password.value
-    }
-    const user = await $fetch<User>(`${config.public.apiBase}/auth/register`, {
-      method: 'POST',
-      body: payload
-    })
+    const user = await auth.register(email.value, fullName.value, password.value)
     registeredEmail.value = user.email
     status.value = 'success'
   } catch (err) {
     status.value = 'error'
-    errorMessage.value = extractErrorDetail(err, 'Registration failed. Check the form and try again.')
+    errorMessage.value = err instanceof Error ? err.message : 'Registration failed. Check the form and try again.'
   }
 }
 
@@ -77,7 +69,7 @@ useSeoMeta({ title: 'Create an account — Workboard' })
     <LoadingIndicator v-if="status === 'pending'" label="Creating your account…" />
     <ErrorAlert v-else-if="status === 'error'" :message="errorMessage" title="Registration failed" />
     <p v-else-if="status === 'success'" class="success">
-      Account created for {{ registeredEmail }} against the real backend.
+      Account created for {{ registeredEmail }}.
       <NuxtLink to="/login">Log in</NuxtLink> to continue.
     </p>
   </div>
