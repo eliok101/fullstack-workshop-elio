@@ -9,6 +9,7 @@ from app.db.session import get_db
 from app.repositories.projects import list_projects_visible_to_user
 from app.schemas.projects import (
     ProjectCreate,
+    ProjectPublicListItem,
     ProjectPublicSummary,
     ProjectRead,
     ProjectUpdate,
@@ -18,6 +19,7 @@ from app.services.projects import (
     delete_project,
     get_public_project_summary,
     get_visible_project_or_404,
+    list_public_project_summaries,
     update_project,
 )
 
@@ -48,6 +50,13 @@ def create_project(
         owner_id=current_user.id,
     )
     return ProjectRead.model_validate(project)
+
+
+@router.get("/projects/public", response_model=list[ProjectPublicListItem])
+def list_public_projects_endpoint(
+    db: Session = Depends(get_db),
+) -> list[ProjectPublicListItem]:
+    return list_public_project_summaries(db)
 
 
 @router.get("/projects/public/{slug}", response_model=ProjectPublicSummary)

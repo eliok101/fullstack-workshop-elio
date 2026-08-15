@@ -36,3 +36,11 @@ class ProjectPublicSummary(BaseModel):
     description: str | None
     task_count: int
     completed_task_count: int
+
+
+class ProjectPublicListItem(BaseModel):
+    """Deliberately narrower than ProjectPublicSummary: a sitemap only needs
+    the URL and a freshness signal, not description/task counts."""
+
+    slug: str
+    updated_at: datetime

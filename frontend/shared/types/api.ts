@@ -49,6 +49,11 @@ export interface ProjectPublicSummary {
   completed_task_count: number
 }
 
+export interface ProjectPublicListItem {
+  slug: string
+  updated_at: string
+}
+
 export interface Task {
   id: number
   project_id: number

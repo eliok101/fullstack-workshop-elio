@@ -21,7 +21,10 @@ async function handleSubmit() {
   }
 }
 
-useSeoMeta({ title: 'Log in — Workboard' })
+// Step 3/Step 1 table: a guest-only auth form has no unique content worth
+// indexing, and sending search traffic here is a dead end for anyone
+// without an existing account - see the route table for the full reasoning.
+useSeoMeta({ title: 'Log in — Workboard', robots: 'noindex, nofollow' })
 </script>
 
 <template>

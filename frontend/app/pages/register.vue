@@ -21,7 +21,9 @@ async function handleSubmit() {
   }
 }
 
-useSeoMeta({ title: 'Create an account — Workboard' })
+// Step 3/Step 1 table: same reasoning as login.vue - a guest-only auth form,
+// noindex rather than indexable.
+useSeoMeta({ title: 'Create an account — Workboard', robots: 'noindex, nofollow' })
 </script>
 
 <template>
