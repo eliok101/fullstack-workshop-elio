@@ -55,3 +55,12 @@ def get_project_task_counts(db: Session, project_id: int) -> tuple[int, int]:
 
 def slug_exists(db: Session, slug: str) -> bool:
     return get_project_by_slug(db, slug) is not None
+
+
+def list_public_projects(db: Session) -> list[Project]:
+    stmt = (
+        select(Project)
+        .where(Project.is_public.is_(True))
+        .order_by(Project.updated_at.desc())
+    )
+    return list(db.execute(stmt).scalars().all())

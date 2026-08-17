@@ -20,6 +20,7 @@ const canAdvance = computed(() => props.task.status !== 'done')
       <h3 class="task-card__title">{{ task.title }}</h3>
       <StatusBadge :status="task.status" />
     </div>
+    <p class="task-card__priority">Priority: {{ priorityLabel(task.priority) }}</p>
     <p v-if="task.description" class="task-card__description">
       {{ task.description }}
     </p>

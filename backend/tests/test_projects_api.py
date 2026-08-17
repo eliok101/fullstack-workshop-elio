@@ -161,6 +161,32 @@ def test_public_project_summary_excludes_private_fields(auth_ctx):
     assert "owner_id" not in body
 
 
+def test_list_public_projects_excludes_private_and_is_unauthenticated(auth_ctx):
+    public_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Sitemap Included Project", "is_public": True},
+        headers=auth_ctx.headers,
+    )
+    private_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Sitemap Excluded Project", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    auth_ctx.created_project_ids.append(public_response.json()["id"])
+    auth_ctx.created_project_ids.append(private_response.json()["id"])
+    public_slug = public_response.json()["slug"]
+    private_slug = private_response.json()["slug"]
+
+    # Deliberately unauthenticated, like /projects/public/{slug}.
+    response = client.get("/api/v1/projects/public")
+    assert response.status_code == 200
+    slugs = [item["slug"] for item in response.json()]
+    assert public_slug in slugs
+    assert private_slug not in slugs
+    listed = next(item for item in response.json() if item["slug"] == public_slug)
+    assert set(listed.keys()) == {"slug", "updated_at"}
+
+
 def test_owner_can_update_project(auth_ctx):
     create_response = client.post(
         "/api/v1/projects",

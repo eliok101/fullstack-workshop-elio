@@ -28,8 +28,9 @@ ps: ## Show service state
 backend-test: ## Run FastAPI starter tests
 	@docker compose run --rm backend pytest
 
-frontend-test: ## Run Nuxt starter type checks
+frontend-test: ## Run Nuxt starter type checks and the Vitest suite
 	@docker compose run --rm frontend npm run typecheck
+	@docker compose run --rm frontend npm test
 
 test: backend-test frontend-test ## Run starter verification
 

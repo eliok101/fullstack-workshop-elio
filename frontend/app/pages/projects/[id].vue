@@ -111,8 +111,10 @@ async function handleDelete(taskId: number) {
   }
 }
 
+// Step 3/Step 1 table: same reasoning as dashboard.vue.
 useSeoMeta({
-  title: () => (project.value ? `${project.value.name} — Workboard` : 'Project — Workboard')
+  title: () => (project.value ? `${project.value.name} — Workboard` : 'Project — Workboard'),
+  robots: 'noindex, nofollow'
 })
 </script>
 

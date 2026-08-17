@@ -13,7 +13,12 @@ const { data: projects, pending, status, error } = await useAsyncData(
   { server: false }
 )
 
-useSeoMeta({ title: 'Dashboard — Workboard' })
+// Step 3/Step 1 table: protected, single-user, always-live data with no
+// crawlability requirement - noindex is defense in depth even though the
+// route is also unreachable pre-auth and now renders client-only (ssr:false
+// in nuxt.config.ts), so there is no server-rendered HTML for a crawler to
+// see here regardless.
+useSeoMeta({ title: 'Dashboard — Workboard', robots: 'noindex, nofollow' })
 </script>
 
 <template>

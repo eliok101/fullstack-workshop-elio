@@ -1892,6 +1892,561 @@ No browser automation was available this session (Claude in Chrome was considere
 
 ---
 
+### Module 12 — SSR, SEO, accessibility, and performance
+
+**Date and branch**
+
+- Date: 2026-08-15
+- Branch: learning/12-ssr-seo-a11y
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Make the one genuinely public page in this app (`/public/projects/[slug]`) actually behave like a public page: real content and metadata in the initial HTML response (not just in the hydrated DOM), a real `404` status when a project is missing or private (not a styled page that still says `200` to anything checking status codes), and correct `noindex`/indexable signaling so search engines index the right pages and skip the rest. Configure route rendering (prerender/SSR/client-only) deliberately per route instead of leaving everything on Nuxt's default, and understand the freshness/failure tradeoff that comes with caching. Verify all of this empirically - HTTP status codes, real response headers, real served HTML - not by reading the component source and assuming it works.
+
+**Scope decision made up front**
+
+No browser automation was available this session (`mcp__claude-in-chrome__tabs_context_mcp` returned "Browser extension is not connected") - the same gap Modules 10 and 11 hit. Step 6 (accessibility) therefore falls back to the same static-verification approach used in those modules: real served HTML/CSS and ARIA attributes checked against spec, not a literal keyboard/screen-reader session. Step 7 (performance) falls back to `curl`-derived timing/size data in place of Lighthouse/DevTools, since neither is installed in this project. Both gaps are documented honestly below rather than claimed as fully verified.
+
+**Step 1 - route classification table**
+
+Extended from my own starting reasoning on `/login` (noindex, SSR optional) and `/dashboard` (noindex, not crawlable anyway since auth-gated, SSR only useful if server-readable auth existed):
+
+| Route | Audience | Rendering | Auth dependency | Indexing | Freshness | Failure status |
+|---|---|---|---|---|---|---|
+| `/` (home) | Anyone, public entry point | Prerendered (build-time, static) | None | Index | Static until next deploy | N/A - static output, nothing to fail at request time |
+| `/login` | Guests with an existing account | SSR (default), optional - cheap static form, no per-request data | Guest-only (middleware redirects an already-authenticated visitor away) | Noindex | Static | Form validation errors only, no page-level failure |
+| `/register` | Guests without an account | SSR (default), optional - same reasoning as `/login` | Guest-only | Noindex | Static | Same as `/login` |
+| `/dashboard` | Returning authenticated users only | Client-only (`ssr:false`) | Authenticated (middleware-protected) | Noindex | Always live, never cached - a stale or cross-user-leaked cache here would be a real security bug, not just staleness | Client-rendered error state on fetch failure; never a page-level 5xx since nothing is rendered server-side to fail |
+| `/projects` | Same as dashboard | Client-only (`ssr:false`) | Authenticated | Noindex | Always live | Same as dashboard |
+| `/projects/[id]` | Same as dashboard | Client-only (`ssr:false`) | Authenticated | Noindex | Always live (task list/statuses change) | Client-rendered "not found" for an id that doesn't belong to/exist for this user |
+| `/public/projects/[slug]` | Anyone - the one page meant to be found/shared | SSR with short SWR (60s) | None - deliberately unauthenticated | Index when the project exists and is public; noindex the instant it's missing or private | Short SWR - not so volatile it needs a fresh render every hit, not so static it should be prerendered (task counts move independently of any deploy) | Real `404` for missing/private (this was broken - see Step 2) |
+
+Reasoning for the extensions beyond the two given examples:
+
+- **`/register`**: same dead-end argument as `/login` - a search engine sending a stranger to a bare signup form with no product context is not a useful result, and the form itself is thin/duplicate-content across virtually every app that has one. I deliberately did *not* treat it as a marketing conversion page (the way a real product might), since this project has no stated acquisition-funnel goal - see `STARTER_SCOPE.md`.
+- **`/dashboard`, `/projects`, `/projects/[id]`**: all three get identical treatment, not just "noindex" but genuinely `ssr:false` (Step 4) - true client rendering, not merely an SSR'd shell with client-only data. The concepts doc (`docs/accessibility-and-seo.md`) names this pattern explicitly ("Client rendering: ... fits protected dashboard interactions where crawlability is not required"), and it has a real second benefit beyond matching the doc: with `ssr:false`, the server never renders any HTML for these routes at all, which removes the entire *category* of hydration-mismatch risk for them, not just the auth-state instance of it.
+- **`/public/projects/[slug]`**: this is the one route the whole module is about, so it gets the opposite treatment on every axis - real SSR, real indexing, real metadata, real 404. The "auth dependency: none" line is not a throwaway detail - it's the direct reason the page must never branch on `auth.isAuthenticated` or any client-only auth state: the only real audience for this page (an anonymous visitor or a crawler) never has a session, so any content gated behind auth state would silently vanish for 100% of the page's actual purpose.
+
+**Step 2 - real 404 for missing/private public projects**
+
+Baselined the *actual* behavior before touching anything, using a real registered user and real public/private projects created against the live backend:
+
+```text
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/public/projects/m12-public-demo
+HTTP 200
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/public/projects/m12-private-demo
+HTTP 200   # BUG - private project, should be 404
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/public/projects/does-not-exist-xyz
+HTTP 200   # BUG - nonexistent slug, should be 404
+```
+
+This is exactly the module's own named failure mode ("Returning a styled error page with HTTP 200 for missing content") - not hypothetical, actually present. Root cause: `useFetch`'s `error` ref was checked to pick which UI branch to render, but nothing ever told the outer Nitro response to actually be a 404 - Nuxt doesn't propagate a `useFetch` error's status code to the page response automatically. Fixed with `setResponseStatus(error.value.statusCode ?? 404)` inside an `import.meta.server` guard in `public/projects/[slug].vue`, run *before* the template renders - this only changes the wire-level HTTP status; the friendly `ErrorAlert` UI is unchanged (the module's failure-mode list is specifically about a styled 200, not about needing an ugly page). The backend's `get_public_project_summary` raises the same `NotFoundError` for both "missing" and "private" (confirmed in `backend/app/services/projects.py`) by design, so this page structurally cannot leak which case it is - the exact resource-scoped-404 pattern already established in Modules 07/08 for authenticated routes, extended here to the one route with no auth at all.
+
+Re-verified after the fix:
+
+```text
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/public/projects/m12-public-demo
+HTTP 200
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/public/projects/m12-private-demo
+HTTP 404
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/public/projects/does-not-exist-xyz
+HTTP 404
+```
+
+Confirmed identically against the real, isolated production Docker image later in this session (see the production-build investigation below) - not just the dev server.
+
+**Step 3 - page-specific metadata**
+
+Added to `public/projects/[slug].vue`: a real `description` (the project's own description, falling back to a computed "`X of Y` tasks complete" sentence when the project has none - never a generic static description), Open Graph title/description/type/url, `twitter:card`, and a canonical link. Added `robots: noindex, nofollow` as a second, independent signal on the error branch (belt-and-braces alongside the real 404 - a 404 URL can still get crawled/cached before it 404s again later). Added the same `noindex` to `login.vue`, `register.vue`, `dashboard.vue`, `projects/index.vue`, `projects/[id].vue` per the Step 1 table. Added Open Graph title/description/type to the home page.
+
+Canonical URL: the module explicitly says "Plan canonical URL once a stable public domain exists" - there is no deployed custom domain yet, so rather than skip this or hardcode `localhost`, added `runtimeConfig.public.siteUrl` (defaults to `http://localhost:3000`, overridable via `NUXT_PUBLIC_SITE_URL`) and built the canonical/OG URLs from it. This makes the mechanism real and testable today and correct in production by setting one env var, no code change - the same pattern this project already uses for `apiBase`/`apiInternalBase`.
+
+No secrets or private fields anywhere in metadata - confirmed by construction: the only data source for the public page's metadata is `ProjectPublicSummary` (`name`, `slug`, `description`, `task_count`, `completed_task_count`), which never included `owner_id` or any private field in the first place (confirmed by the existing Module 10 test `test_public_project_summary_excludes_private_fields`).
+
+Verified via real served HTML, both dev and the real production build:
+
+```html
+<title>M12 Public Demo — Workboard</title>
+<meta name="description" content="A public project used for Module 12 SSR/SEO verification.">
+<meta property="og:title" content="M12 Public Demo — Workboard">
+<meta property="og:description" content="A public project used for Module 12 SSR/SEO verification.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="http://localhost:3000/public/projects/m12-public-demo">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="http://localhost:3000/public/projects/m12-public-demo">
+```
+
+```text
+$ curl -s http://localhost:3000/login | grep -io '<meta name="robots"[^>]*>'
+<meta name="robots" content="noindex, nofollow">
+$ curl -s http://localhost:3000/register | grep -io '<meta name="robots"[^>]*>'
+<meta name="robots" content="noindex, nofollow">
+```
+
+**Step 4 - route rendering/cache configuration, and a real bug it exposed**
+
+`nuxt.config.ts` `routeRules`: `/` prerendered; `/public/projects/**` gets `swr: 60`; `/dashboard`, `/dashboard/**`, `/projects`, `/projects/**` get `ssr: false`. (Added both the exact path and the `/**` wildcard for `/dashboard` and `/projects` after checking - Nitro's route-rule matching on a bare `/**` glob was not something I wanted to assume matches the exact parent path too, so both are explicit.)
+
+Prerendering `/` exposed a real correctness problem I hadn't anticipated: the home page's `useFetch('/api/health')` call would, once prerendered, run exactly once at *build* time and get baked into the static output forever - "Backend reachable via server-side render: alive" would keep showing verbatim during a real outage, and a build-time backend hiccup would freeze a false "unreachable" message into every page load until the next deploy. Fixed by moving that fetch to `{ server: false }` (client-only), so it runs fresh in each visitor's own browser after hydration instead of being frozen into the static HTML - the hero content above it has no such per-request dependency and is exactly what should stay prerendered. This reintroduced the same `status === 'idle'` vs `pending` distinction Module 11 already found and fixed on `/dashboard` (with `server:false`, the fetch never starts during the prerender pass, so `pending` is `false` and `status` is `'idle'`, not "checked and failed") - applied the identical fix here before it became a second instance of the same bug.
+
+Verified `ssr:false` actually took effect, not just configured and assumed:
+
+```text
+$ curl -s http://localhost:3000/dashboard | grep -o '<body[^>]*>.*</body>'
+<body><div id="__nuxt"></div>...<script ... data-ssr="false" id="__NUXT_DATA__">[{"serverRendered":1},false]</script></body>
+```
+
+`data-ssr="false"`, an empty `<div id="__nuxt"></div>`, no title/h1/project data anywhere in the response - genuinely nothing server-rendered to leak or mismatch against, for `/dashboard`, `/projects`, and `/projects/1` alike.
+
+Verified prerendering actually took effect via the real build log, not just the config:
+
+```text
+[nitro] ℹ Prerendering 1 routes
+[nitro]   ├─ / (463ms)
+[nitro] ℹ Prerendered 2 routes in 7.902 seconds
+```
+
+**Verifying SWR/backend-down behavior required the real production build - and that build was completely broken**
+
+Nuxt dev mode doesn't meaningfully apply Nitro's cache layer, so testing "what happens when the backend is down and a cached page exists" (the module's own explicit Step 4 requirement) needed the actual production artifact. First attempt - running the already-built `.output` directly via `docker compose run --rm frontend node .output/server/index.mjs` - hit a real `500`:
+
+```text
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/workspace/.output/server/node_modules/vue/index.mjs' imported from /workspace/.output/server/chunks/routes/renderer.mjs
+```
+
+Suspecting this was an artifact of my own improvised test harness (running the bundle inside the bind-mounted dev container rather than the project's actual defined production path), I rebuilt using the real thing - `docker build --target production ./frontend`, the exact stage `frontend/Dockerfile` defines for deployment. It failed too, but differently and earlier, at `npm run build` itself:
+
+```text
+app/plugins/api.ts(22,27): error TS2304: Cannot find name 'useAuthStore'.
+app/stores/auth.ts(70,24): error TS18046: '$api' is of type 'unknown'.
+eslint.config.mjs(2,22): error TS2307: Cannot find module './.nuxt/eslint.config.mjs'
+```
+
+**Failure investigated #1 - clean production build fails typecheck entirely**
+
+- Symptom: `docker build --target production ./frontend` fails at `npm run build` with dozens of "cannot find name" errors for things that plainly exist in the source (`useAuthStore`, `useProjectsApi`, shared types, etc).
+- Smallest reproduction: the same failure, deterministically, on two separate clean builds (confirmed via `PIPESTATUS`, not `tail`'s exit code - the exact same mistake I'd already documented catching in Module 10, caught again here before treating either run as authoritative).
+- Hypothesis: the `.nuxt/` generated type declarations that make Nuxt's auto-imports resolve for TypeScript were never (re)generated against the real project source inside this Docker stage.
+- Evidence: `frontend/Dockerfile`'s `dependencies` stage runs `npm ci` (which triggers `postinstall: nuxt prepare`) *before* `COPY . .` ever happens in that stage - at that point only `package.json`/`package-lock.json` exist, no `nuxt.config.ts`, no `app/`, nothing for `nuxt prepare` to scan. The later `build` stage does `COPY . .` then runs `npm run build` directly, with no explicit `nuxt prepare` step run against the now-real source. This exact failure had never surfaced before because every previous `npm run build` in this project's history (including my own Step 8 gate below) ran via `docker compose run --rm frontend npm run build` *inside the already-running dev container*, which has a `.nuxt/` already generated from `nuxt dev` and persisted on the host bind mount - masking the gap completely. The actual `production` Docker stage, it turns out, had never been built clean before in this repository's history (`compose.yaml` runs `target: development`; nothing in this project's history through Module 11 builds `target: production` directly).
+- Root cause: `frontend/Dockerfile`'s `build` stage never re-runs `nuxt prepare` after the real source is copied in, so a genuinely clean build has no auto-import type declarations to typecheck against.
+- Prevention/fix: added `RUN npm run postinstall` immediately after `COPY . .` in the `build` stage, before `RUN npm run build`. Rebuilt clean - `docker build --target production ./frontend` now exits `0`.
+
+**Failure investigated #2 - production image builds, but every SSR'd route 500s**
+
+- Symptom: with the typecheck fix in place, the image builds successfully, but every route that needs Vue to render on the server (`/public/projects/[slug]`, `/login`, even `/dashboard` despite `ssr:false`, since the initial HTML shell still goes through the same renderer) returns `500`. Only genuinely static/non-Vue routes work - the prerendered `/`, and the plain Nitro server routes `sitemap.xml`/`robots.txt`.
+- Smallest reproduction: `docker run` the real, isolated production image (built fresh, no bind mounts, on the Compose network so `backend:8000` resolves) and `curl` any SSR'd route - `500` every time, deterministically.
+- Hypothesis: Nitro's `node-server` preset doesn't ship all of `node_modules` into `.output/server` - it traces which files are actually needed at runtime and copies only those. If that trace missed a file `vue/server-renderer` itself depends on, the base `vue` package would be incompletely copied.
+- Evidence that confirmed it: inspected the packaged image directly - `docker run --rm <image> ls -la /app/server/node_modules/vue/` showed only `package.json` and a `server-renderer/` subfolder; `vue/server-renderer`'s own code needs the base Vue runtime (`vue/index.mjs`, `dist/`) that the tracer never copied. The `package.json`'s own `"files"` field lists `index.mjs`/`dist` as real, expected package contents - they exist in the real installed package, they just never made it into the traced output.
+- Root cause: Nitro's dependency file-tracer failed to follow `vue/server-renderer`'s internal (non-statically-obvious) import of the base `vue` package, so the base package's actual runtime files were left out of the production bundle even though its `package.json` was copied.
+- Prevention/fix: added `nitro: { externals: { inline: ['vue', 'vue/server-renderer'] } }` to `nuxt.config.ts` - this bundles both packages directly into the server chunks instead of leaving them as external files the (buggy) tracer has to separately copy, sidestepping the gap entirely rather than patching around its symptom. Rebuilt clean; every previously-500ing route now returns its correct real status against the real production image:
+
+```text
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3001/public/projects/m12-public-demo
+HTTP 200
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3001/dashboard
+HTTP 200
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3001/login
+HTTP 200
+$ curl -s -o /dev/null -w "private: HTTP %{http_code}\n" http://localhost:3001/public/projects/m12-private-demo
+HTTP 404
+$ curl -s -o /dev/null -w "missing: HTTP %{http_code}\n" http://localhost:3001/public/projects/does-not-exist-xyz
+HTTP 404
+```
+
+This is, honestly, the most significant finding of this module - a production-blocking defect that had existed silently in this repository since the frontend Dockerfile was written, invisible because nothing had ever exercised the real `production` build stage in isolation before. It surfaced only because Step 4 required testing real cache/outage behavior against a real production artifact instead of trusting the dev server.
+
+**Step 4 continued - the actual SWR/backend-down test, against the fixed real production image**
+
+```text
+$ curl -s -D - -o /dev/null http://localhost:3001/public/projects/m12-public-demo | grep -i cache
+cache-control: s-maxage=60, stale-while-revalidate
+
+$ docker compose stop backend
+Container fullstack-intern-starter-backend-1 Stopped
+
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3001/public/projects/m12-public-demo   # already-cached page
+HTTP 200   # full real content still served, backend fully down
+
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3001/public/projects/module-11-public-regression-check   # never-cached page
+HTTP 500   # no cache entry to fall back to, live fetch fails
+
+$ docker compose start backend   # restored before continuing
+```
+
+Documented, evidence-backed answer to the module's own question: an already-warmed SWR cache entry insulates visitors from a real backend outage for the cache's window (60s here) - real content, real `200`, backend fully unreachable. That protection does not extend to a page nobody has visited yet during the outage; those still fail hard. This is a genuine limitation of the `swr:60` choice, not a bug: a longer window trades more outage resilience for staler content on every hit, and nothing here builds graceful degradation for a first-time visit mid-outage - documented as a known gap rather than solved, since building it was outside what Step 4 actually asked for ("document what happens").
+
+Backend was fully restored (`docker compose start backend`, confirmed `/health/ready` returning `200` again) before any further work in this session.
+
+**Step 5 - validate initial HTML (module's own exact commands)**
+
+```text
+$ curl --fail http://localhost:3000/public/projects/m12-public-demo > /tmp/public-project.html
+$ echo $?
+0
+$ grep -i '<title' /tmp/public-project.html
+<title>M12 Public Demo — Workboard</title>
+$ grep -i 'description' /tmp/public-project.html
+<meta name="description" content="A public project used for Module 12 SSR/SEO verification.">
+$ grep -i '<h1' /tmp/public-project.html
+<h1>M12 Public Demo</h1>
+```
+
+Confirmed project content (`<h1>`, description, "0 of 0 tasks complete") is present in the raw response body before any client JavaScript runs - `curl` cannot execute JS, so this is a genuine SSR proof, not a hydrated-DOM proof (the module's own named failure mode: "Inspecting only the hydrated DOM and claiming SSR works"). No real browser "view source" session was available this session (extension not connected) - the `curl`-based proof above is the honest substitute, same limitation class as Modules 10/11.
+
+**Step 6 - accessibility audit (static verification, browser extension unavailable)**
+
+Heading hierarchy, re-checked via real served HTML for every page that still SSRs (single clean `<h1>`, no skips, on `/`, `/login`, `/register`, `/public/projects/[slug]`):
+
+```text
+$ curl -s http://localhost:3000/ | grep -io '<h[1-6][^>]*>[^<]*</h[1-6]>'
+<h1>Workboard</h1>
+```
+(same pattern confirmed for `/login`, `/register`, and the public project page - one `<h1>`, nothing else, each.)
+
+`/dashboard`, `/projects`, `/projects/[id]` can no longer be heading-checked via `curl` at all after Step 4's `ssr:false` change - there is genuinely no server-rendered HTML for `curl` to inspect there anymore (confirmed above: `data-ssr="false"`, empty `<div id="__nuxt">`). Verified their heading structure by direct source review instead (`dashboard.vue` h1 → `ProjectCard` h2; `projects/[id].vue` h1 → h2 "Tasks" → `TaskCard` h3) - unchanged from the hierarchy Module 10 already fixed and Module 11 preserved; I did not touch these components' templates this module, only their `<script>` blocks' `useSeoMeta` calls.
+
+Other checks, all via source/served-artifact inspection (no live keyboard/screen-reader session possible without the browser extension):
+
+- No non-native clickable elements: `grep -rn "@click"` across `app/` still finds exactly the same 5 matches as Module 10/11 (`AppHeader`'s logout, `PaginationControls`' prev/next, `TaskCard`'s advance/delete), all real `<button type="button">` elements. My changes added zero new interactive elements.
+- Labels: unchanged from Module 10/11 (I only edited `<script>` blocks, not form templates) - every input still has a matching `<label for>`.
+- Focus visibility, skip-link, reduced-motion: confirmed present in the actual served stylesheet (`focus-visible` outline rules, `.skip-link`, `@media (prefers-reduced-motion: reduce)` disabling the loading spinner's animation) by reading `frontend/app/assets/css/main.css` directly - all three unchanged and still real, not just written and assumed applied.
+- Status/error identification independent of color: `LoadingIndicator` (`role="status"`, `aria-live="polite"`) and `ErrorAlert` (`role="alert"`, text title + message) unchanged - confirmed by reading both components directly.
+- Zoom/narrow viewport: `main.css` uses `rem`/`clamp()`/percentage units throughout (no fixed-`px` widths that would break reflow), plus an explicit `@media (max-width: 640px)` rule for the header - confirmed by direct review, not a live 200%-zoom session.
+
+Honest gap: no live browser session (keyboard-only journey, actual 200% zoom rendering, real screen-reader pass) was possible - `mcp__claude-in-chrome__tabs_context_mcp` reported the extension not connected. Everything above is real evidence from the actual served artifacts, not assumption, but it is not the same class of proof as watching a real assistive-technology session, and I'm not claiming it is.
+
+**Step 7 - performance observation**
+
+No Lighthouse and no connected browser DevTools this session - used `curl` timing/size data as the honest substitute:
+
+```text
+$ curl -s -o /dev/null -w "ttfb: %{time_starttransfer}s total: %{time_total}s size: %{size_download} bytes\n" http://localhost:3000/public/projects/m12-public-demo
+ttfb: 0.040s total: 0.040s size: 2833 bytes
+```
+
+Real production build output (from Step 8's build below): single bundled/hashed CSS file per page (`entry.OuwjsmNG.css`), no duplicate stylesheet links - the dev server's response for the same page shows *two* `<link rel="stylesheet">` tags for what's effectively the same CSS (Vite dev-mode serving both the aliased and workspace-relative source paths), confirmed as a dev-only artifact by diffing against the real production HTML, which correctly serves one bundled file. No external fonts are loaded (`--font-sans: Inter, ui-sans-serif, system-ui, sans-serif` falls straight through to system fonts since no `@font-face`/webfont `<link>` exists anywhere), so there's no font-loading layout-shift risk to begin with.
+
+Decision: documented non-action, not a fix. At this app's current scale - a 2.8KB HTML response, one small CSS bundle, no images, no third-party scripts, ~40ms local TTFB - there is no real bottleneck to justify code-splitting further, adding resource hints, or building an image pipeline that has nothing to optimize yet (no images exist). Doing any of that now would be exactly the "premature optimization" the module explicitly warns against. The one real, evidence-backed lever that *does* exist at this app's current scale is the SWR cache window from Step 4, and that's a freshness/availability tradeoff already made and documented there, not a pure performance win.
+
+**Step 8 - SEO/SSR acceptance test plan**
+
+No test runner exists in this project yet (Vitest arrives in Module 13; `frontend/package.json` still has no `test` script) - per this module's own "Plan or implement" wording and the same pattern used for untestable pieces in Modules 10/11, this is a written plan, not executable tests:
+
+1. `GET /public/projects/<real-public-slug>` → `200`; response body contains the project's real `name` in an `<h1>`, and a `<meta name="description">` whose content is non-empty and project-specific (not a fixed string repeated across projects).
+2. `GET /public/projects/<private-or-nonexistent-slug>` → `404`; response includes `<meta name="robots" content="noindex, nofollow">`.
+3. `GET /login`, `GET /register`, `GET /dashboard` (as an authenticated session), `GET /projects` → each includes `noindex` (dashboard/projects via the client-only shell having nothing indexable at all; login/register via the explicit meta tag).
+4. No Vue hydration-mismatch warning is logged to the browser console during: home page load → navigate to a public project page → log in → visit dashboard → visit a project detail page. (Needs a real browser automation tool; not executable this session - see the Step 6 gap.)
+5. `GET /sitemap.xml` → `200`, `content-type: application/xml`; contains `<loc>` for `/` and every currently-public project's slug; does not contain any project confirmed private in the same test's setup.
+6. `GET /robots.txt` → `200`; contains `Disallow: /dashboard`, `Disallow: /projects`, and a `Sitemap:` line pointing at the real site's `/sitemap.xml`.
+7. Freshness: request a public project page, mutate the project's task counts via the authenticated API, request the same public page again within the SWR window - assert the *first* re-request may still show the old count (documented staleness), and a request after the window elapses shows the updated count.
+
+**Independent challenge - generated sitemap and robots configuration**
+
+Implemented for real, not deferred to a design note - it needed one small, well-justified backend addition (a `GET /api/v1/projects/public` list endpoint returning only `slug` + `updated_at` for every currently-public project, mirroring the existing single-slug `/projects/public/{slug}` endpoint's "no auth, no private fields" shape) plus two new Nuxt server routes.
+
+- **How public projects are discovered**: `frontend/server/routes/sitemap.xml.ts` queries the new backend list endpoint on every request (not cached/prerendered) - the backend's live `is_public` flag is the single source of truth for what belongs in the sitemap.
+- **How stale/deleted projects are removed**: no separate cleanup job exists or is needed - because the sitemap route re-queries the live backend on every request rather than working from a snapshot, a project that gets deleted or flipped to private simply stops appearing in the very next `sitemap.xml` fetch. Verified directly: `m12-private-demo` (created private) never appears in `sitemap.xml`'s output; only the 6 currently-public projects in the dev database do.
+- **How this scales beyond a small dataset**: documented honestly as a real, current limitation rather than faked - this returns every public project in one uncapped query and one XML document, fine at this project's current scale (a handful of projects) but not compliant with the real sitemap protocol limit (50,000 URLs / 50MB per file). The standard real fix is a sitemap index file referencing multiple paginated sub-sitemaps, which itself needs a paginated backend list endpoint (`limit`/`offset` or keyset pagination) - and no list endpoint in this API has pagination yet (noted as a gap back in my own Module 03 log entry, still true). Building fake pagination against a backend endpoint that has none would have been misleading rather than useful, so I stopped at documenting the real constraint instead.
+
+`robots.txt` (`frontend/server/routes/robots.txt.ts`) disallows `/dashboard` and `/projects` (both now `ssr:false` - genuinely nothing for a crawler to fetch there) and references the real sitemap URL. Deliberately did **not** disallow `/login`/`/register` even though both are `noindex`: Google's own guidance is that `Disallow` prevents a crawler from ever fetching a page at all, which means it never sees that page's `noindex` meta tag either - `Disallow` and `noindex` are two different, non-composable mechanisms, and using `Disallow` on a page whose actual goal is "let it be fetched, just don't index it" would work against that goal. Verified via `curl`:
+
+```text
+$ curl -s http://localhost:3000/robots.txt
+User-agent: *
+Disallow: /dashboard
+Disallow: /projects
+
+Sitemap: http://localhost:3000/sitemap.xml
+
+$ curl -s http://localhost:3000/sitemap.xml | grep -o "m12-private-demo"
+(no output - confirmed absent)
+```
+
+Backend: added `list_public_projects` (repository), `list_public_project_summaries` (service), `GET /projects/public` (route, returns `list[ProjectPublicListItem]`), and a new test (`test_list_public_projects_excludes_private_and_is_unauthenticated`) asserting the endpoint is unauthenticated, excludes a private project created in the same test, and returns exactly `{slug, updated_at}` - no name/description/owner leakage. Full backend suite: `55 passed`.
+
+**Commands and evidence - final quality gate**
+
+Every command below run fresh, after every change in this session including the Dockerfile/nuxt.config fixes, with exit codes captured via `PIPESTATUS` (not piped through `tail`, after the Module 10 lesson on that):
+
+```text
+$ docker compose run --rm backend pytest -q
+....................................................... [100%]
+55 passed
+
+$ docker compose run --rm frontend npm run lint
+LINT_EXIT=0
+
+$ docker compose run --rm frontend npm run typecheck
+TYPECHECK_EXIT=0   # same pre-existing benign vue-router/volar warning as every prior module, non-fatal
+
+$ docker build -t <tag> --target production ./frontend
+FINAL_BUILD_EXIT=0   # the REAL production Docker stage, not the dev-container shortcut - see Step 4's investigation for why that distinction mattered this module
+```
+
+This is a stronger gate than any prior module's: previous modules' "build" evidence was `npm run build` executed inside the already-`nuxt prepare`d dev container, which (as Step 4 found) was silently masking a real defect in the actual deployment path. This module's final gate is the first time in this project's history the real, isolated `production` Docker stage has been built and run end-to-end.
+
+**Decision and tradeoff**
+
+Chose `nitro: { externals: { inline: ['vue', 'vue/server-renderer'] } }` over alternatives like pinning a different nitropack version or manually copying missing files into `.output` post-build. Inlining is a one-line, low-risk config change that directly targets the confirmed root cause (the tracer's gap around `vue/server-renderer`'s internal import) rather than working around its symptom, and it costs a small amount of extra size in the server bundle (both packages get bundled directly instead of left as separately-copied external files) - an acceptable tradeoff for a small app, worth revisiting if nitropack ships an upstream fix and the inline override becomes unnecessary.
+
+**Security, privacy, and operations**
+
+The new `GET /api/v1/projects/public` endpoint is deliberately unauthenticated, matching the existing single-slug endpoint - verified it returns only `slug`/`updated_at`, never owner/description/task data, so it can't be used to enumerate private information even though it requires no login. The real-404 fix (Step 2) closes a minor information-disclosure gap of its own: before this module, a private project's slug still returned `200` (distinguishable from a nonexistent slug only by body content, not status), which is a softer version of the same "existence oracle" problem Modules 07/08 already solved for authenticated project access - now both authenticated and public access paths agree on returning an indistinguishable 404 rather than leaking existence via status code. No secrets in metadata (checked in Step 3). No new migrations - the new endpoint returns existing `Project` columns, no schema change.
+
+**Review feedback**
+
+N/A - no pull request opened yet for this module.
+
+**Remaining uncertainty**
+
+- Whether `nitro.externals.inline` for `vue`/`vue/server-renderer` is the *idiomatic* fix nitropack maintainers would recommend, versus a nitropack/vue-bundle-renderer version bump that fixes the tracer gap upstream - I confirmed my fix resolves the observed symptom with real evidence, but haven't checked nitropack's own issue tracker for whether this is a known, already-patched-in-a-later-version bug.
+- Whether the installed `vue@3.5.40` (found while investigating the packaging bug) versus `package.json`'s pinned `"vue": "3.5.28"` is itself worth tightening to an exact pin - noted but not investigated further, since it wasn't the root cause of anything found this module.
+- The accessibility and performance verification gaps (Step 6/7) both depend on a browser automation tool that wasn't connected this session - real evidence from served artifacts was gathered in its place, but a live browser pass (keyboard journey, real 200% zoom, Lighthouse/DevTools trace) is still genuinely outstanding, same as it was after Modules 10 and 11.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - the production-build diagnosis (missing nuxt prepare in the build stage, Nitro's dependency tracer failing to bundle vue/server-renderer's internal import) and the specific Nitro/Vue tracing edge cases are the parts I would keep notes for; the route classification, SSR/prerender/client-only tradeoffs, the resource-scoped 404 pattern extended to the one unauthenticated public route, and the SWR caching decision I can apply directly without notes.
+- I can explain it without the reference code: yes - ssr:false means there is no server-produced page DOM for Vue to hydrate against at all, so a hydration mismatch is structurally impossible for that route, not just avoided in one instance (client-rendered UI can still have loading/state-transition bugs, but not SSR-to-client hydration disagreement, since there is no SSR output to disagree with). Cache/outage behavior needs the real production artifact because development runs a genuinely different execution path (prepared dependencies, dev-mode transforms, looser module resolution, no production bundling/tracing/pruning) - the dev server's "it works" proves nothing about what the actual deployed bundle does. Disallow and noindex are non-composable because Disallow blocks crawling entirely, meaning a crawler never even reaches the page to see its noindex tag - for a page that should be fetchable but excluded from results, the page must remain crawlable (not Disallowed) while carrying noindex.
+- I can diagnose one failure in this area: yes - would reproduce in the isolated build/runtime image first, separate build-stage failure from runtime/bundling/tracing failure, and inspect the actual generated artifacts and dependency resolution directly rather than treating dev-server behavior as evidence of anything about production.
+- Confidence from 1-5: 5/5 for the concepts and investigation methodology (route classification reasoning, SSR/hydration/caching tradeoffs, and the discipline of testing against real production artifacts rather than the dev server); 4/5 for unfamiliar framework-specific packaging internals (Nitro's file-tracing behavior specifically) until verified against that exact tool's real production image, which is precisely what this module's investigation required and did.
+
+---
+
+### Module 13 — Frontend testing with Vitest
+
+**Date and branch**
+
+- Date: 2026-08-17
+- Branch: learning/13-frontend-tests
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Pick the cheapest layer that can actually catch a given frontend risk instead of defaulting to mounting a component (or worse, a browser) for everything - a date-formatting bug belongs in a pure function test that runs in milliseconds, not a Playwright journey. Configure Vitest for a real Nuxt app the way Nuxt itself recommends, not by copying a generic Vitest starter. Write tests that assert what a user or a calling module actually depends on (visible text, accessible roles, emitted events, request shape) rather than component internals. Mock only the real boundary of whatever's under test - a fake fetcher for the API client, a fake store for a component, never the function being tested itself. Then prove the whole suite is worth trusting by deliberately breaking three real behaviors and confirming the tests actually notice.
+
+**Step 1 - frontend risk map**
+
+Built after actually implementing each layer below (not purely speculatively) so the reasoning reflects what was genuinely necessary, not a guess:
+
+| Risk | Layer | Reasoning |
+|---|---|---|
+| status label mapping | Pure unit (`tests/unit/labels.spec.ts`) | Was a private, unexported record inside `StatusBadge.vue`'s `<script setup>` - impossible to unit-test without mounting the component. Extracted to `app/utils/labels.ts` (`statusLabel`) specifically so the mapping itself is directly testable, the module's own "lowest useful layer" principle taken literally. |
+| date formatting | Pure unit (`tests/unit/date.spec.ts`) | Deterministic string transformation (null/undefined/empty/invalid/valid in, exact string out) with zero Vue/DOM/Nuxt dependency - the fastest, most direct layer available. Real, honestly-disclosed finding: nothing in this codebase currently displays a date anywhere (see "Real bugs and gaps found" below) - written and tested pre-emptively per this module's own named risk-map item, not invented UI to manufacture a place to use it. |
+| API error normalization | Pure unit, two functions (`tests/unit/normalize-error.spec.ts`, `tests/unit/api-error.spec.ts`) | Both `normalizeError` (`api-client.ts`, the client's own internal shape) and `extractErrorDetail` (`api-error.ts`, used directly by `public/projects/[slug].vue`) are plain, already-pure functions once `normalizeError` was exported (see gaps below) - no reason to pay for a component mount or Nuxt context to test a pure `unknown -> ApiError`/`string` mapping. |
+| task card advance event | Component (`tests/components/TaskCard.spec.ts`) | Needs a real Vue component tree, real `@click`-to-`emit` wiring, and Nuxt's auto-registered `StatusBadge` child - a pure function test can't observe an emitted event at all. |
+| form disabled while saving | Component (`tests/components/register-page.spec.ts`) | `:disabled="status === 'pending'"` is a template binding driven by real reactive state during a genuinely in-flight async call - only a mounted component with a controllable (fake) async boundary can observe the mid-flight state, not a pure function. |
+| API base/header/body behavior | API-client, fake fetcher (`tests/services/api-client.spec.ts`) | This is specifically about what `createApiClient`'s `request()` passes to the transport layer - needs the real orchestration logic exercised against a fake fetcher, not a live network call (too slow/flaky) and not a full Nuxt app (the client is deliberately Nuxt-context-free by design - see gaps below). |
+| one refresh/retry after 401 | API-client, fake fetcher (same file) | Same reasoning - the refresh-once/retry-once/no-recursion logic is pure orchestration around three injected callbacks, exactly what the client's own docstring already claimed it was built for. |
+| auth middleware redirect | Nuxt-aware (`tests/nuxt/auth-middleware.spec.ts`) | Genuinely needs real Nuxt route/composable context (`useAuthStore`, `navigateTo`) and the actual `await initAuth()`-before-deciding ordering - a pure function test can't fake Nuxt's auto-import machinery, and this isn't a rendered component either (no template, no DOM). |
+| server-rendered public metadata | Already covered at the correct layer (Module 12), not duplicated here | Genuinely requires a real SSR HTTP response (real Nitro server, real status codes/headers) - Module 12 already verified this by `curl` against the real production build. Re-proving it via a Vitest component mount wouldn't even exercise the real HTTP/SSR path, and duplicating an already-covered risk at a lower-fidelity layer is exactly what `docs/testing-strategy.md` warns against ("Do not duplicate every scenario at every layer"). |
+| complete registration/project/task journey | Reserved for Playwright (Module 15) | Explicit instruction in the module text. A real multi-page browser journey through the actual running stack isn't reproducible by mounting isolated components against fakes. |
+
+**Step 2 - Vitest setup**
+
+Checked before assuming: `frontend/package.json` had no test runner, no `test` script, and no `frontend/tests/` directory at all - confirmed by reading the file directly, matching Module 10-12's own repeatedly-documented "no test runner yet" gap.
+
+Checked Nuxt's own testing approach (`docs/getting-started/testing`) rather than wiring a generic Vitest+jsdom config: Nuxt recommends `@nuxt/test-utils`, `happy-dom` (not `jsdom`) as the DOM environment, and - for this exact Vitest 4 / `@nuxt/test-utils` 4.1 combination - the new `test.projects` array (Vitest 4's replacement for the deprecated `environmentMatchGlobs`) combined with `@nuxt/test-utils/config`'s `defineVitestProject` helper for the Nuxt-aware slice.
+
+Installed (`docker compose run --rm frontend npm install --save-dev ...`, matching the container-based install pattern every prior frontend module used - `package-lock.json` and the container's Node 22.16 are the source of truth, not the host's Node 24): `vitest@^4.1.10`, `@nuxt/test-utils@^4.1.0`, `happy-dom@^20.11.2`, `@vue/test-utils@^2.4.11`, and (added slightly later, once Step 4 needed genuine role/name queries - see below) `@testing-library/vue@^8.1.0`.
+
+Wrote `frontend/vitest.config.ts` with two projects, not one shared environment:
+- `unit` - `environment: 'happy-dom'`, covers `tests/unit/**` and `tests/services/**`. Deliberately plain, no Nuxt Vite plugins: the codebase's own pure functions (labels, date, error normalization, the API client factory) are built with "no Nuxt app context needed" as an explicit design property (see `api-client.ts`'s own docstring) - running them under the full Nuxt environment would hide that property instead of proving it, and a Nuxt environment measurably costs more per file (~2s vs ~15ms below).
+- `nuxt` - `defineVitestProject({ environment: 'nuxt' })`, covers `tests/components/**` and `tests/nuxt/**`. Only tests that genuinely need Nuxt auto-imports/component resolution/route context pay that cost.
+
+Added `"test": "vitest run"` to `package.json`'s scripts. Created `frontend/tests/{unit,services,components,nuxt}/` matching `docs/testing-strategy.md`'s own documented layout (`tests/unit/`, `tests/components/`, `tests/services/` - I added `tests/nuxt/` for the one test that's Nuxt-aware but isn't a component, since the doc doesn't name a folder for that case).
+
+Verified before writing a single test, per the module's explicit instruction: ran `docker compose run --rm frontend npm test` against zero test files.
+
+```text
+ RUN  v4.1.10 /workspace
+No test files found, exiting with code 1
+
+ unit
+include: tests/unit/**/*.spec.ts, tests/services/**/*.spec.ts
+exclude:  **/node_modules/**, **/.git/**
+
+ nuxt
+include: tests/components/**/*.spec.ts, tests/nuxt/**/*.spec.ts
+exclude:  **/node_modules/**, **/.git/**
+```
+
+Both projects registered correctly with the right globs; exit 1 is the correct, expected behavior for zero matching files, not a config error - config wiring confirmed before any real test existed.
+
+**Real bugs and gaps found - fixed with root cause, per this module's own repeated pattern**
+
+1. **`api-client.ts`'s own docstring was false.** It already claimed the client "receives a fetcher... so it can be unit-tested with a fake fetcher/store, with no Nuxt app context needed" (written in Module 11), but `request()` actually called the global Nuxt-auto-imported `$fetch` directly - there was no way to inject a fetcher at all. Undetected since Module 11 because no test suite existed to exercise the claim. Root cause: the docstring described an intended design that was never actually implemented. Fix: added an optional `fetcher?: typeof $fetch` field to `ApiClientOptions`, defaulting to the real global `$fetch` (`options.fetcher ?? $fetch`, evaluated lazily inside `createApiClient` so the bare `$fetch` identifier is never touched at all when a test always supplies a fake - confirmed safe to import this file under the plain `happy-dom` project, which has no Nuxt auto-imports). `plugins/api.ts` needed zero changes since it never sets the new field.
+2. **`TaskCard.vue` never rendered `priority` at all**, even though `Task.priority` (`TaskPriority`) has existed on the wire type since it was defined. This made the module's own explicit Step 4 requirement ("assert visible status/priority/title") literally false for this codebase - there was no priority text to assert. Root cause: Modules 10-12 built the dashboard's authentication/SSR/routing concerns and never circled back to surface every `Task` field. Fix: added `priorityLabel(task.priority)` display to `TaskCard.vue` (new `app/utils/labels.ts` function, same extraction as status), and a genuine `TaskCard.spec.ts` assertion on it - not a test asserting a fabricated fact.
+3. **`StatusBadge.vue`'s label mapping was private and inline**, blocking Step 3's explicit "status... label" pure-utility test from being possible without mounting a component. Fix: extracted to `app/utils/labels.ts::statusLabel`, `StatusBadge.vue` now calls it instead of duplicating the record (auto-imported, confirmed via the existing project convention - `extractErrorDetail` is used the same unimported way already, in `public/projects/[slug].vue`).
+4. **The first version of `formatDate` had a latent hydration-mismatch bug identical in kind to what Module 12 targeted**, caught by reasoning about it before writing a test, not by a test failure: `Intl.DateTimeFormat` without an explicit `timeZone` uses the *runtime's local timezone*. SSR (this project's Docker containers) and a visitor's browser can be in different timezones, so the exact same ISO date string could render different text server-side vs. after client hydration for any date near a UTC day boundary - a real hydration mismatch, not a cosmetic issue. Fixed by pinning `timeZone: 'UTC'` explicitly. Verified the exact resulting strings (not assumed) via a real Node check inside the container before writing the corresponding test assertions:
+   ```text
+   $ docker compose run --rm frontend node -e "console.log(new Date('2026-13-45').toString()); ..."
+   Invalid Date
+   Invalid Date
+   Invalid Date
+   Aug 17, 2026
+   Jan 5, 2026
+   ```
+5. **`register.vue`'s success message text is split across a `<p>` and an inline `<NuxtLink>`** ("Account created for X. `<a>Log in</a>` to continue."), so an exact-string `screen.findByText(...)` query never matches any single element - my first version of that test hung until timeout. Not a product bug (the real markup and behavior are fine and arguably good UX - the link belongs inline); a test-construction mistake, fixed by querying with a substring-matching function scoped to the `<p>` tag instead of a literal string.
+6. **My own first version of the "first 401 retries" API-client test passed for the wrong reason.** Its fake `getAccessToken` returned a hardcoded constant regardless of whether `refresh()` had run - the real plugin wires `getAccessToken` to the auth store's `accessToken` ref, which the real `refresh()` (`rawRefresh`) mutates as a side effect; a fake that ignores that contract can't actually prove the retry uses the *new* token. Caught immediately by asserting the retry call's actual `Authorization` header instead of just asserting the client didn't throw. Fixed by making the fake stateful (`let currentToken`, mutated inside the fake `refresh`).
+7. **A genuinely dangerous test-construction bug, found during the mutation drill (Step 7 below), not before it**: the "does not recurse on a second 401" test used a fetcher mock that rejects with 401 *forever* (`mockRejectedValue`, no bound). That's safe against the real, correct client (which stops after one retry regardless), but when deliberately mutated to remove the retry cap, running that exact test **OOM-crashed the Node test runner** (`FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory`) instead of failing cleanly - the unbounded mock let the unbounded recursion consume memory until the process died, faster than any `--testTimeout` flag could intervene. This is a real, generalizable finding about mutation testing, not just this codebase: an infinite-domain mock is unsafe to combine with a mutation that removes the exact guard the mock was implicitly relying on. Fixed for real (not just for the drill) by bounding the mock to 5 rejections before resolving - the test still fully proves the real client's behavior (it never reaches call 3, let alone 6) and is now safe to run against any mutant.
+8. **`.nuxtrc`, auto-generated in `frontend/` by `@nuxt/test-utils` itself the first time the `nuxt` Vitest environment booted** (`setups.@nuxt/test-utils="4.1.0"`), was untracked and not covered by any `.gitignore` rule - a machine-written marker file, not something meant to be hand-authored or committed. Added `.nuxtrc` to the root `.gitignore` alongside the existing `.nuxt/`/`.output/` entries.
+9. **`npm audit` reports 5 pre-existing vulnerabilities (2 moderate, 3 high)** after installing the new test dependencies - checked whether the new dependencies caused this via `git diff --stat frontend/package-lock.json` plus a targeted diff around `"nuxt":` (no version bump found for `nuxt` itself). All 5 trace to the already-pinned `nuxt@4.4.8`'s own transitive dependencies (`@nuxt/vite-builder`, `nanoid`, `postcss`, `brace-expansion`) - unrelated to Vitest/`@nuxt/test-utils`/`@testing-library/vue`. `npm audit fix --force` would bump `nuxt` to `4.5.2`, outside its deliberately pinned exact version - out of scope for a testing module and risky without the kind of dedicated verification Module 10-12 did for framework/packaging changes. Documented rather than silently run or silently ignored.
+
+**Step 3 - pure utility tests**
+
+`tests/unit/labels.spec.ts` (6 tests, table-driven over all 3 `TaskStatus` and all 3 `TaskPriority` values), `tests/unit/date.spec.ts` (8 tests: 3 null/undefined/empty-string cases, 3 unparseable-string cases, 2 valid-date cases with exact-string assertions, no snapshots), `tests/unit/normalize-error.spec.ts` (8 tests covering every branch: detail+code, detail without code, 422 without a string detail, non-422 without a string detail, no status at all, and 3 non-object error values), `tests/unit/api-error.spec.ts` (5 tests: string detail, missing detail, FastAPI's 422 array detail, a plain `TypeError` network failure, and 3 non-object values). All exact-value (`toBe`/`toEqual`) assertions, zero snapshots.
+
+**Step 4 - component tests**
+
+`tests/components/TaskCard.spec.ts` (7 tests): visible title/status-label/priority-label text; `advance`/`delete` emitted with the correct task id via `onAdvance`/`onDelete` props (role/name query via `screen.getByRole('button', { name: ... })`, not a CSS selector); Advance disabled once `status === 'done'`; Advance enabled for `backlog`/`in_progress` (table-driven); Delete never disabled regardless of status.
+
+`tests/components/register-page.spec.ts` (3 tests) - the "form/display component": no dedicated `FormXxx.vue` exists yet in this codebase (every form is written directly inside its page), so `register.vue` was used directly as the only genuine "disabled while saving" behavior available, with `useAuthStore` mocked via `mockNuxtImport` (a controllable `vi.fn()` for `register`, plus the full shape `auth.global.ts`'s middleware needs - see gap below). Covers: submit button shows "Creating account…" and is disabled while the (manually-controlled) promise is pending; success message with the real registered email once resolved, button re-enabled; accessible error alert (`role="alert"`) with the real thrown message on failure, button re-enabled.
+
+Switched from plain `@vue/test-utils` (`mountSuspended` + CSS-selector `wrapper.find`) to `@testing-library/vue`'s `renderSuspended`/`screen`/`fireEvent` partway through this step, after discovering Vue Test Utils has no `getByRole` at all (confirmed by grepping its own type declarations - zero matches) - real role/name accessible querying, which the module explicitly asks for, requires Testing Library, not just VTU. Added as a new devDependency for this reason, documented rather than faked with a CSS-selector workaround.
+
+**Step 5 - API client tests**
+
+`tests/services/api-client.spec.ts` (10 tests), the real `createApiClient` exercised with a fake `fetcher` (`vi.fn()`) and fake `getAccessToken`/`refresh`/`onAuthFailure` callbacks - never mocking `request()` itself. Covers every item the module names: base URL + bearer header attached (and *not* attached when there's no token); method/body forwarded exactly; GET is the default method; a normal success returns the fetcher's result unchanged; a first 401 refreshes exactly once and retries with the new token (asserted on the actual retry header, not just "didn't throw" - see gap #6 above); refresh failure calls `onAuthFailure` exactly once and rejects with the *original* 401, normalized; a second 401 after an already-refreshed retry does not call `refresh` again and does not call `onAuthFailure` (the retry's 401 falls straight to `normalizeError`, never re-entering the refresh branch at all); a non-401 error is normalized without ever touching `refresh`. Added one test beyond the module's minimum list, directly verifying a design property the client's own source comment claims but nothing had ever checked: two concurrent 401s share exactly one in-flight refresh (not one each).
+
+**Step 6 - auth middleware test**
+
+`tests/nuxt/auth-middleware.spec.ts` (6 tests). Picked "auth middleware redirect" over the log-out-on-network-failure alternative, since it's the one Step-1 risk that genuinely needs Nuxt route context - exactly what this step is for. `defineNuxtRouteMiddleware(fn)` just returns `fn` unchanged (confirmed by reading Nuxt's own source expectations - it's a typing/registration wrapper, not a runtime transform), so the default export was imported and called directly with fake `to`/`from` route objects; `useAuthStore` and `navigateTo` mocked via `mockNuxtImport`. Covers: unauthenticated visitor to `/dashboard` redirected to `/login?redirect=/dashboard`; same for a nested protected path (`/projects/5`); authenticated visitor on a protected route is not redirected; authenticated visitor on `/login` is sent to `/dashboard`; unauthenticated guest on `/login` is left alone; `initAuth()` is always awaited to completion before any redirect decision is made (asserted via call-order, not just call-count).
+
+Real, honestly-disclosed environment limitation: the `if (import.meta.server) return` guard at the top of the middleware has no automated coverage here - `import.meta.server` is a Vite-time constant baked into the `nuxt` Vitest environment's client-mode build, not something this test can flip per-case. It's a single trivial early-return statement, and was already manually re-verified live via `curl` in Module 11 for the equivalent client-only routes; that manual check, not a test, is what backs this specific branch today.
+
+**Step 7 - mutation drill**
+
+Three mutations, one at a time, narrow tests run, restored, `git diff` confirmed clean before moving to the next:
+
+*Mutation 1 - reverse the status label* (`app/utils/labels.ts`, swapped `'Backlog'`/`'Done'` between the `backlog`/`done` keys):
+
+```text
+FAILED tests/unit/labels.spec.ts > statusLabel > maps backlog to exactly Backlog
+FAILED tests/unit/labels.spec.ts > statusLabel > maps done to exactly Done
+2 failed, 11 passed
+```
+
+Caught cleanly at the dedicated pure-unit layer. `TaskCard.spec.ts`'s 7 tests all still passed unaffected - its one status-text assertion uses `in_progress` (untouched by this mutation), and its disabled-state assertions key off the raw `task.status` value, not the label text. Confirmed this is correct layering, not a gap: `docs/testing-strategy.md` explicitly says not to duplicate every scenario at every layer, and `labels.spec.ts` is already the exhaustive, dedicated owner of this exact contract for all 3 status values. Restored; `git diff` clean.
+
+*Mutation 2 - emit the wrong task ID* (`TaskCard.vue`, `emit('advance', task.id)` → `emit('advance', task.id + 1)`):
+
+```text
+FAILED tests/components/TaskCard.spec.ts > TaskCard > emits advance with the task id when the Advance button is clicked
+AssertionError: expected "vi.fn()" to be called once with arguments: [ 99 ]
+Received: [ 100 ]
+1 failed, 6 passed
+```
+
+Caught immediately and precisely - the failure message shows the exact wrong value received. Restored; `git diff` clean.
+
+*Mutation 3 - let the API client refresh/retry repeatedly* (`api-client.ts`, `if (status === 401 && !isRetry)` → `if (status === 401)`, removing the retry cap):
+
+First attempt at verifying this - running the existing "does not recurse" test as originally written (persistent 401 mock) - **OOM-crashed the test runner** rather than failing cleanly (see gap #7 above; this was itself the most important finding of this step, not a side note). Fixed the test to use a bounded mock (5 rejections then success) - a real, permanent hardening, not a one-off workaround for this drill - then re-ran against the still-active mutation:
+
+```text
+FAILED tests/services/api-client.spec.ts > createApiClient > does not recurse on a second 401 after an already-refreshed retry - refresh runs exactly once
+AssertionError: promise resolved "{ ok: true }" instead of rejecting
+- Expected: Error { "message": "rejected promise" }
++ Received: { "ok": true }
+1 failed, 9 passed
+```
+
+Caught cleanly and safely (84ms) once the mock was bounded - the mutated client kept retrying until the mock's rejections ran out and it finally got a fake 200, exactly proving the removed cap's real-world consequence (a client that would hammer a genuinely-down auth server forever instead of failing fast). Restored the guard; `git diff` clean.
+
+No mutation survived undetected. `git diff --stat frontend/app/` after all three restorations shows only the Step-2-through-6 legitimate changes (labels extraction, priority display, fetcher injection/`normalizeError` export) - confirmed no residual mutation state before the final gate.
+
+**Step 8 - full gate, real output**
+
+```text
+$ docker compose run --rm frontend npm run lint
+> eslint .
+(no output, exit 0)
+
+$ docker compose run --rm frontend npm run typecheck
+> nuxt typecheck
+[Vue] Resolve plugin path failed: vue-router/volar/sfc-route-blocks ... ERR_PACKAGE_PATH_NOT_EXPORTED
+(exit 0 - same benign pre-existing Volar-plugin warning documented in every prior frontend module's log; vue-tsc's own type check is unaffected by it)
+
+$ docker compose run --rm frontend npm test
+ RUN  v4.1.10 /workspace
+
+ ✓ unit  tests/services/api-client.spec.ts (10 tests) 128ms
+ ✓ unit  tests/unit/labels.spec.ts (6 tests) 16ms
+ ✓ unit  tests/unit/date.spec.ts (8 tests) 81ms
+ ✓ unit  tests/unit/normalize-error.spec.ts (8 tests) 14ms
+ ✓ unit  tests/unit/api-error.spec.ts (5 tests) 10ms
+ ✓ nuxt  tests/nuxt/auth-middleware.spec.ts (6 tests) 1804ms
+ ✓ nuxt  tests/components/ErrorAlert.spec.ts (2 tests) 2064ms
+ ✓ nuxt  tests/components/TaskCard.spec.ts (7 tests) 2087ms
+ ✓ nuxt  tests/components/register-page.spec.ts (3 tests) 1668ms
+
+ Test Files  9 passed (9)
+      Tests  55 passed (55)
+   Duration  7.56s (transform 12.38s, setup 1.99s, import 10.89s, tests 7.87s, environment 18.02s)
+(exit 0)
+
+$ docker compose run --rm frontend npm run build
+✔ Client built in 10104ms
+✔ Server built in 8271ms
+[nitro] ℹ Prerendering 1 routes
+[nitro] ℹ Prerendered 2 routes in 3.063 seconds
+Σ Total size: 4.7 MB (1.2 MB gzip)
+✨ Build complete!
+(exit 0)
+```
+
+All four real, current, run in this session - no result asserted without the command output backing it up in the same turn.
+
+Also updated `Makefile`'s `frontend-test` target to run `npm test` alongside the pre-existing `npm run typecheck` (previously the only frontend check wired into `make test`), matching the `backend-test`/pytest pattern already established - a real test runner existing and not being wired into the project's own gate would be a gap in itself.
+
+**Independent challenge - accessibility-focused component test**
+
+Implemented for real (`tests/components/ErrorAlert.spec.ts`, 2 tests), not deferred to a design note. Verifies `ErrorAlert` exposes its message through `role="alert"` (queried via `screen.getByRole('alert')`, a real accessible-role query, not a CSS class check) with both the default and a custom title, for both the default-title and custom-title cases.
+
+What this test actually proves: `role="alert"` implicitly carries `aria-live="assertive"` and `aria-atomic="true"` per the ARIA spec - a conforming screen reader announces an element with this role the instant it enters (or changes within) the accessibility tree, with no separate `aria-live` wiring required. Querying by role/name instead of a CSS selector proves the accessible contract a real assistive-technology user depends on genuinely exists in the rendered DOM. This codebase's error alerts are whole-form errors (login/register failure), not single-field ones, so `role="alert"` is the correct association mechanism here rather than `aria-describedby` - which this codebase already uses correctly elsewhere for a genuinely single-field case (`register.vue`'s password hint, `aria-describedby="register-password-hint"`, confirmed by reading the real markup).
+
+What this test cannot prove, and still needs a real browser/manual assistive-technology review:
+- Whether an actual screen reader (NVDA/JAWS/VoiceOver) really announces this element on mount versus only on a later *change* - some real AT implementations only announce live-region content that changes after initial page load, not content present at first paint. `happy-dom` implements no accessibility tree and speaks nothing at all; it only proves the DOM attribute is present and correctly named, not that anything is actually announced.
+- Focus movement: after a failed submit, focus stays on the submit button; whether a screen-reader user actually notices the alert without focus being moved there programmatically (a `tabindex="-1"` + `.focus()` pattern some forms use) is a real UX judgment call this test doesn't evaluate.
+- Interruption behavior: `role="alert"` is meant to interrupt whatever a screen reader is currently announcing, which is genuinely disruptive if triggered too often (e.g. on every keystroke of a live-validating field) - only a real assistive-technology session can judge whether that's appropriate, not a unit test.
+
+**Failure investigated**
+
+- Symptom: the mutation-drill run for "remove the API client's retry cap" (Step 7, Mutation 3) crashed the Node test process with `FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory` instead of producing a failing test.
+- Smallest reproduction: `createApiClient` with the `!isRetry` guard removed, driven by a fetcher mock that rejects with a 401 unconditionally (`mockRejectedValue`, no call-count bound) and a `refresh` mock that always succeeds.
+- Hypothesis: the recursive `return request<T>(path, init, true)` call, now never gated, recurses once per 401 forever; since each recursive call still goes through a real `await`, it doesn't blow the synchronous call stack (no `RangeError`) - it instead keeps allocating new promise/closure state per iteration indefinitely.
+- Evidence that confirmed it: reran the identical scenario with the fetcher mock bounded to 5 rejections before succeeding - the mutation now produced a clean, fast (84ms), correctly-failing assertion (`promise resolved "{ ok: true }" instead of rejecting`) instead of a crash, confirming the crash was purely a function of the mock's unboundedness combined with the missing cap, not some other interaction.
+- Root cause: a test double with an infinite domain (a mock that never stops producing the same failure) implicitly relies on the code under test to be the thing that terminates the interaction - which is exactly the property the mutation removed. The mock and the guard it was implicitly depending on were never supposed to be tested together this way.
+- Prevention/test added: bounded the "does not recurse" test's fetcher mock to a fixed 5 rejections (permanent fix to the committed test, not a one-off drill workaround) - it still fully proves the real client's cap (which only ever reaches 2 fetcher calls) while remaining safe to execute against any future mutant that touches this guard.
+
+**Decision and tradeoff**
+
+Split the Vitest config into two `projects` (plain `happy-dom` for pure logic, a real `nuxt` environment only for component/route-aware tests) instead of running everything under one Nuxt environment. Alternative considered: a single `environment: 'nuxt'` for every test file, which is simpler to configure and would have worked correctly for all 55 tests. Rejected because it would silently contradict `api-client.ts`'s own explicit design claim ("no Nuxt app context needed") every time those tests ran, and because the timing difference is real and would compound as the suite grows: the `unit` project's 37 tests ran in well under a second of actual test time, while the 5 Nuxt-aware component/middleware tests each took 1.4-2.9s just for environment setup per file. Fits this specific codebase because the module's own architecture (a plain-factory API client, extractable pure label/date/error functions) was already deliberately built to not need Nuxt context - the config should reflect and enforce that property, not paper over it.
+
+**Security, privacy, and operations**
+
+No secrets, credentials, or real backend calls anywhere in this test suite - every network boundary (the API client's fetcher, the auth store's `register`) is a fake `vi.fn()`, never a real `$fetch` against the live backend, so nothing here touches the actual dev database or real user data. The `npm audit` findings surfaced while installing test tooling (gap #9 above) were investigated and confirmed pre-existing/unrelated rather than silently ignored or silently "fixed" by force-bumping a pinned framework version outside its stated range. No new environment variables, no new secrets, no migrations - purely a devDependency and test-file addition plus small, real, documented source fixes (fetcher injection, priority display, label extraction, UTC-pinned date formatting).
+
+**Review feedback**
+
+N/A - no pull request opened yet for this module.
+
+**Remaining uncertainty**
+
+- Whether `frontend/tests/nuxt/` (added for the one Nuxt-aware-but-not-a-component test) is the right permanent home, or whether `docs/testing-strategy.md` should be updated to name that folder explicitly now that a real example exists - noted but not changed, since editing the strategy doc itself felt like a decision worth flagging for review rather than making unilaterally in the same module that first needed it.
+- Whether `TaskCard`'s new priority display and the still-unused `formatDate` utility should be extended further (e.g. actually showing `due_date` on `TaskCard`) is a real product-completeness question, not something this testing module should decide unprompted - flagged, not resolved.
+- The `import.meta.server` early-return branch in `auth.global.ts` (Step 6) has no automated test - whether that's acceptable long-term or worth a dedicated SSR-mode Vitest project of its own is an open question.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - reproducing the workflow directly, would use notes for the risk-map layering table and the exact Vitest/Nuxt test-project configuration details.
+- I can explain it without the reference code: yes - mocking the API client's own request function bypasses the behavior under test entirely, so it would only prove the mock returns what it was told to return, not that the client actually constructs the right headers, forwards the right body, or handles errors correctly. An infinite-domain mock (one that never stops producing the same rejection) is dangerous when combined with mutation testing because a mutation that removes a termination guard turns a finite failure path into genuinely non-terminating work, which crashed the test runner via OOM rather than failing cleanly - the mock and the guard it implicitly depended on were never meant to be exercised together that way. role="alert" is correct for an important, dynamic error that must be announced automatically the moment it appears, since the role itself carries implicit live-region semantics; aria-describedby only associates static descriptive text with a specific control and does not trigger any announcement on its own.
+- I can diagnose one failure in this area: yes - would start with a risk map, define test boundaries and environments deliberately, use fakes only at genuine external boundaries rather than mocking the subject under test, cover SSR/client and accessibility semantics explicitly, then use targeted mutation testing to validate the suite actually catches real regressions rather than just existing.
+- Confidence from 1-5: 5/5 - the main remaining caveat is that real assistive-technology announcement behavior still needs manual screen-reader validation, since semantic markup alone proves the DOM contract exists, not that a real screen reader actually announces it the way the specification implies.
+
+---
+
 ## Module entry template
 
 ### Module NN — title

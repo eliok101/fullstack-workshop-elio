@@ -43,7 +43,8 @@ async function handleCreate() {
 const demoPage = ref(1)
 const demoTotalPages = 3
 
-useSeoMeta({ title: 'Projects — Workboard' })
+// Step 3/Step 1 table: same reasoning as dashboard.vue.
+useSeoMeta({ title: 'Projects — Workboard', robots: 'noindex, nofollow' })
 </script>
 
 <template>

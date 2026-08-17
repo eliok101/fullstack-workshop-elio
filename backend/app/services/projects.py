@@ -12,9 +12,10 @@ from app.repositories.projects import (
     get_project_by_slug,
     get_project_task_counts,
     is_project_visible_to_user,
+    list_public_projects,
     slug_exists,
 )
-from app.schemas.projects import ProjectPublicSummary
+from app.schemas.projects import ProjectPublicListItem, ProjectPublicSummary
 
 
 def slugify(name: str) -> str:
@@ -93,3 +94,14 @@ def get_public_project_summary(db: Session, slug: str) -> ProjectPublicSummary:
         task_count=total,
         completed_task_count=completed,
     )
+
+
+def list_public_project_summaries(db: Session) -> list[ProjectPublicListItem]:
+    """Backs the sitemap: every currently public project's slug + freshness
+    signal. No description/owner/task data - a sitemap consumer (crawler or
+    our own sitemap.xml route) never needs more than a URL and a last-modified
+    date, and this keeps the endpoint safe to leave unauthenticated."""
+    projects = list_public_projects(db)
+    return [
+        ProjectPublicListItem(slug=p.slug, updated_at=p.updated_at) for p in projects
+    ]
