@@ -47,7 +47,7 @@ interface FetchErrorLike {
   data?: { detail?: unknown; code?: unknown }
 }
 
-function normalizeError(err: unknown): ApiError {
+export function normalizeError(err: unknown): ApiError {
   if (err && typeof err === 'object') {
     const fetchErr = err as FetchErrorLike
     const status = typeof fetchErr.status === 'number' ? fetchErr.status : null
@@ -74,6 +74,18 @@ export interface ApiClientOptions {
   refresh: () => Promise<string | null>
   /** Called once a refreshed token still gets a 401 - i.e. the session is genuinely gone. */
   onAuthFailure: () => void | Promise<void>
+  /**
+   * Real gap found while writing Module 13's API-client tests: this
+   * module's own docstring above already claimed the client "receives a
+   * fetcher... so it can be unit-tested with a fake fetcher/store, with no
+   * Nuxt app context needed" - but until this field existed, `request()`
+   * called the global Nuxt-auto-imported `$fetch` directly, which doesn't
+   * exist outside a Nuxt app context at all. Undetected because no test
+   * suite existed to exercise it (Module 10-12's own documented gap).
+   * Defaults to the real global `$fetch` in production (see plugins/api.ts,
+   * which never sets this); tests inject a fake.
+   */
+  fetcher?: typeof $fetch
 }
 
 export interface ApiClient {
@@ -84,6 +96,8 @@ export interface ApiClient {
 }
 
 export function createApiClient(options: ApiClientOptions): ApiClient {
+  const fetcher = options.fetcher ?? $fetch
+
   // Shared across calls that 401 concurrently so two in-flight requests
   // trigger exactly one refresh, not one each.
   let refreshPromise: Promise<string | null> | null = null
@@ -105,7 +119,7 @@ export function createApiClient(options: ApiClientOptions): ApiClient {
       // way that conflicts with an arbitrary caller-supplied T here. The
       // cast below is the one place that promise lives - see the
       // compile-time-only-contract warning in shared/types/api.ts.
-      const response = await $fetch(path, {
+      const response = await fetcher(path, {
         baseURL: options.baseURL(),
         method: init.method ?? 'GET',
         body: init.body as never,

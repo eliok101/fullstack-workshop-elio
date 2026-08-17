@@ -2213,6 +2213,240 @@ N/A - no pull request opened yet for this module.
 
 ---
 
+### Module 13 — Frontend testing with Vitest
+
+**Date and branch**
+
+- Date: 2026-08-17
+- Branch: learning/13-frontend-tests
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Pick the cheapest layer that can actually catch a given frontend risk instead of defaulting to mounting a component (or worse, a browser) for everything - a date-formatting bug belongs in a pure function test that runs in milliseconds, not a Playwright journey. Configure Vitest for a real Nuxt app the way Nuxt itself recommends, not by copying a generic Vitest starter. Write tests that assert what a user or a calling module actually depends on (visible text, accessible roles, emitted events, request shape) rather than component internals. Mock only the real boundary of whatever's under test - a fake fetcher for the API client, a fake store for a component, never the function being tested itself. Then prove the whole suite is worth trusting by deliberately breaking three real behaviors and confirming the tests actually notice.
+
+**Step 1 - frontend risk map**
+
+Built after actually implementing each layer below (not purely speculatively) so the reasoning reflects what was genuinely necessary, not a guess:
+
+| Risk | Layer | Reasoning |
+|---|---|---|
+| status label mapping | Pure unit (`tests/unit/labels.spec.ts`) | Was a private, unexported record inside `StatusBadge.vue`'s `<script setup>` - impossible to unit-test without mounting the component. Extracted to `app/utils/labels.ts` (`statusLabel`) specifically so the mapping itself is directly testable, the module's own "lowest useful layer" principle taken literally. |
+| date formatting | Pure unit (`tests/unit/date.spec.ts`) | Deterministic string transformation (null/undefined/empty/invalid/valid in, exact string out) with zero Vue/DOM/Nuxt dependency - the fastest, most direct layer available. Real, honestly-disclosed finding: nothing in this codebase currently displays a date anywhere (see "Real bugs and gaps found" below) - written and tested pre-emptively per this module's own named risk-map item, not invented UI to manufacture a place to use it. |
+| API error normalization | Pure unit, two functions (`tests/unit/normalize-error.spec.ts`, `tests/unit/api-error.spec.ts`) | Both `normalizeError` (`api-client.ts`, the client's own internal shape) and `extractErrorDetail` (`api-error.ts`, used directly by `public/projects/[slug].vue`) are plain, already-pure functions once `normalizeError` was exported (see gaps below) - no reason to pay for a component mount or Nuxt context to test a pure `unknown -> ApiError`/`string` mapping. |
+| task card advance event | Component (`tests/components/TaskCard.spec.ts`) | Needs a real Vue component tree, real `@click`-to-`emit` wiring, and Nuxt's auto-registered `StatusBadge` child - a pure function test can't observe an emitted event at all. |
+| form disabled while saving | Component (`tests/components/register-page.spec.ts`) | `:disabled="status === 'pending'"` is a template binding driven by real reactive state during a genuinely in-flight async call - only a mounted component with a controllable (fake) async boundary can observe the mid-flight state, not a pure function. |
+| API base/header/body behavior | API-client, fake fetcher (`tests/services/api-client.spec.ts`) | This is specifically about what `createApiClient`'s `request()` passes to the transport layer - needs the real orchestration logic exercised against a fake fetcher, not a live network call (too slow/flaky) and not a full Nuxt app (the client is deliberately Nuxt-context-free by design - see gaps below). |
+| one refresh/retry after 401 | API-client, fake fetcher (same file) | Same reasoning - the refresh-once/retry-once/no-recursion logic is pure orchestration around three injected callbacks, exactly what the client's own docstring already claimed it was built for. |
+| auth middleware redirect | Nuxt-aware (`tests/nuxt/auth-middleware.spec.ts`) | Genuinely needs real Nuxt route/composable context (`useAuthStore`, `navigateTo`) and the actual `await initAuth()`-before-deciding ordering - a pure function test can't fake Nuxt's auto-import machinery, and this isn't a rendered component either (no template, no DOM). |
+| server-rendered public metadata | Already covered at the correct layer (Module 12), not duplicated here | Genuinely requires a real SSR HTTP response (real Nitro server, real status codes/headers) - Module 12 already verified this by `curl` against the real production build. Re-proving it via a Vitest component mount wouldn't even exercise the real HTTP/SSR path, and duplicating an already-covered risk at a lower-fidelity layer is exactly what `docs/testing-strategy.md` warns against ("Do not duplicate every scenario at every layer"). |
+| complete registration/project/task journey | Reserved for Playwright (Module 15) | Explicit instruction in the module text. A real multi-page browser journey through the actual running stack isn't reproducible by mounting isolated components against fakes. |
+
+**Step 2 - Vitest setup**
+
+Checked before assuming: `frontend/package.json` had no test runner, no `test` script, and no `frontend/tests/` directory at all - confirmed by reading the file directly, matching Module 10-12's own repeatedly-documented "no test runner yet" gap.
+
+Checked Nuxt's own testing approach (`docs/getting-started/testing`) rather than wiring a generic Vitest+jsdom config: Nuxt recommends `@nuxt/test-utils`, `happy-dom` (not `jsdom`) as the DOM environment, and - for this exact Vitest 4 / `@nuxt/test-utils` 4.1 combination - the new `test.projects` array (Vitest 4's replacement for the deprecated `environmentMatchGlobs`) combined with `@nuxt/test-utils/config`'s `defineVitestProject` helper for the Nuxt-aware slice.
+
+Installed (`docker compose run --rm frontend npm install --save-dev ...`, matching the container-based install pattern every prior frontend module used - `package-lock.json` and the container's Node 22.16 are the source of truth, not the host's Node 24): `vitest@^4.1.10`, `@nuxt/test-utils@^4.1.0`, `happy-dom@^20.11.2`, `@vue/test-utils@^2.4.11`, and (added slightly later, once Step 4 needed genuine role/name queries - see below) `@testing-library/vue@^8.1.0`.
+
+Wrote `frontend/vitest.config.ts` with two projects, not one shared environment:
+- `unit` - `environment: 'happy-dom'`, covers `tests/unit/**` and `tests/services/**`. Deliberately plain, no Nuxt Vite plugins: the codebase's own pure functions (labels, date, error normalization, the API client factory) are built with "no Nuxt app context needed" as an explicit design property (see `api-client.ts`'s own docstring) - running them under the full Nuxt environment would hide that property instead of proving it, and a Nuxt environment measurably costs more per file (~2s vs ~15ms below).
+- `nuxt` - `defineVitestProject({ environment: 'nuxt' })`, covers `tests/components/**` and `tests/nuxt/**`. Only tests that genuinely need Nuxt auto-imports/component resolution/route context pay that cost.
+
+Added `"test": "vitest run"` to `package.json`'s scripts. Created `frontend/tests/{unit,services,components,nuxt}/` matching `docs/testing-strategy.md`'s own documented layout (`tests/unit/`, `tests/components/`, `tests/services/` - I added `tests/nuxt/` for the one test that's Nuxt-aware but isn't a component, since the doc doesn't name a folder for that case).
+
+Verified before writing a single test, per the module's explicit instruction: ran `docker compose run --rm frontend npm test` against zero test files.
+
+```text
+ RUN  v4.1.10 /workspace
+No test files found, exiting with code 1
+
+ unit
+include: tests/unit/**/*.spec.ts, tests/services/**/*.spec.ts
+exclude:  **/node_modules/**, **/.git/**
+
+ nuxt
+include: tests/components/**/*.spec.ts, tests/nuxt/**/*.spec.ts
+exclude:  **/node_modules/**, **/.git/**
+```
+
+Both projects registered correctly with the right globs; exit 1 is the correct, expected behavior for zero matching files, not a config error - config wiring confirmed before any real test existed.
+
+**Real bugs and gaps found - fixed with root cause, per this module's own repeated pattern**
+
+1. **`api-client.ts`'s own docstring was false.** It already claimed the client "receives a fetcher... so it can be unit-tested with a fake fetcher/store, with no Nuxt app context needed" (written in Module 11), but `request()` actually called the global Nuxt-auto-imported `$fetch` directly - there was no way to inject a fetcher at all. Undetected since Module 11 because no test suite existed to exercise the claim. Root cause: the docstring described an intended design that was never actually implemented. Fix: added an optional `fetcher?: typeof $fetch` field to `ApiClientOptions`, defaulting to the real global `$fetch` (`options.fetcher ?? $fetch`, evaluated lazily inside `createApiClient` so the bare `$fetch` identifier is never touched at all when a test always supplies a fake - confirmed safe to import this file under the plain `happy-dom` project, which has no Nuxt auto-imports). `plugins/api.ts` needed zero changes since it never sets the new field.
+2. **`TaskCard.vue` never rendered `priority` at all**, even though `Task.priority` (`TaskPriority`) has existed on the wire type since it was defined. This made the module's own explicit Step 4 requirement ("assert visible status/priority/title") literally false for this codebase - there was no priority text to assert. Root cause: Modules 10-12 built the dashboard's authentication/SSR/routing concerns and never circled back to surface every `Task` field. Fix: added `priorityLabel(task.priority)` display to `TaskCard.vue` (new `app/utils/labels.ts` function, same extraction as status), and a genuine `TaskCard.spec.ts` assertion on it - not a test asserting a fabricated fact.
+3. **`StatusBadge.vue`'s label mapping was private and inline**, blocking Step 3's explicit "status... label" pure-utility test from being possible without mounting a component. Fix: extracted to `app/utils/labels.ts::statusLabel`, `StatusBadge.vue` now calls it instead of duplicating the record (auto-imported, confirmed via the existing project convention - `extractErrorDetail` is used the same unimported way already, in `public/projects/[slug].vue`).
+4. **The first version of `formatDate` had a latent hydration-mismatch bug identical in kind to what Module 12 targeted**, caught by reasoning about it before writing a test, not by a test failure: `Intl.DateTimeFormat` without an explicit `timeZone` uses the *runtime's local timezone*. SSR (this project's Docker containers) and a visitor's browser can be in different timezones, so the exact same ISO date string could render different text server-side vs. after client hydration for any date near a UTC day boundary - a real hydration mismatch, not a cosmetic issue. Fixed by pinning `timeZone: 'UTC'` explicitly. Verified the exact resulting strings (not assumed) via a real Node check inside the container before writing the corresponding test assertions:
+   ```text
+   $ docker compose run --rm frontend node -e "console.log(new Date('2026-13-45').toString()); ..."
+   Invalid Date
+   Invalid Date
+   Invalid Date
+   Aug 17, 2026
+   Jan 5, 2026
+   ```
+5. **`register.vue`'s success message text is split across a `<p>` and an inline `<NuxtLink>`** ("Account created for X. `<a>Log in</a>` to continue."), so an exact-string `screen.findByText(...)` query never matches any single element - my first version of that test hung until timeout. Not a product bug (the real markup and behavior are fine and arguably good UX - the link belongs inline); a test-construction mistake, fixed by querying with a substring-matching function scoped to the `<p>` tag instead of a literal string.
+6. **My own first version of the "first 401 retries" API-client test passed for the wrong reason.** Its fake `getAccessToken` returned a hardcoded constant regardless of whether `refresh()` had run - the real plugin wires `getAccessToken` to the auth store's `accessToken` ref, which the real `refresh()` (`rawRefresh`) mutates as a side effect; a fake that ignores that contract can't actually prove the retry uses the *new* token. Caught immediately by asserting the retry call's actual `Authorization` header instead of just asserting the client didn't throw. Fixed by making the fake stateful (`let currentToken`, mutated inside the fake `refresh`).
+7. **A genuinely dangerous test-construction bug, found during the mutation drill (Step 7 below), not before it**: the "does not recurse on a second 401" test used a fetcher mock that rejects with 401 *forever* (`mockRejectedValue`, no bound). That's safe against the real, correct client (which stops after one retry regardless), but when deliberately mutated to remove the retry cap, running that exact test **OOM-crashed the Node test runner** (`FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory`) instead of failing cleanly - the unbounded mock let the unbounded recursion consume memory until the process died, faster than any `--testTimeout` flag could intervene. This is a real, generalizable finding about mutation testing, not just this codebase: an infinite-domain mock is unsafe to combine with a mutation that removes the exact guard the mock was implicitly relying on. Fixed for real (not just for the drill) by bounding the mock to 5 rejections before resolving - the test still fully proves the real client's behavior (it never reaches call 3, let alone 6) and is now safe to run against any mutant.
+8. **`.nuxtrc`, auto-generated in `frontend/` by `@nuxt/test-utils` itself the first time the `nuxt` Vitest environment booted** (`setups.@nuxt/test-utils="4.1.0"`), was untracked and not covered by any `.gitignore` rule - a machine-written marker file, not something meant to be hand-authored or committed. Added `.nuxtrc` to the root `.gitignore` alongside the existing `.nuxt/`/`.output/` entries.
+9. **`npm audit` reports 5 pre-existing vulnerabilities (2 moderate, 3 high)** after installing the new test dependencies - checked whether the new dependencies caused this via `git diff --stat frontend/package-lock.json` plus a targeted diff around `"nuxt":` (no version bump found for `nuxt` itself). All 5 trace to the already-pinned `nuxt@4.4.8`'s own transitive dependencies (`@nuxt/vite-builder`, `nanoid`, `postcss`, `brace-expansion`) - unrelated to Vitest/`@nuxt/test-utils`/`@testing-library/vue`. `npm audit fix --force` would bump `nuxt` to `4.5.2`, outside its deliberately pinned exact version - out of scope for a testing module and risky without the kind of dedicated verification Module 10-12 did for framework/packaging changes. Documented rather than silently run or silently ignored.
+
+**Step 3 - pure utility tests**
+
+`tests/unit/labels.spec.ts` (6 tests, table-driven over all 3 `TaskStatus` and all 3 `TaskPriority` values), `tests/unit/date.spec.ts` (8 tests: 3 null/undefined/empty-string cases, 3 unparseable-string cases, 2 valid-date cases with exact-string assertions, no snapshots), `tests/unit/normalize-error.spec.ts` (8 tests covering every branch: detail+code, detail without code, 422 without a string detail, non-422 without a string detail, no status at all, and 3 non-object error values), `tests/unit/api-error.spec.ts` (5 tests: string detail, missing detail, FastAPI's 422 array detail, a plain `TypeError` network failure, and 3 non-object values). All exact-value (`toBe`/`toEqual`) assertions, zero snapshots.
+
+**Step 4 - component tests**
+
+`tests/components/TaskCard.spec.ts` (7 tests): visible title/status-label/priority-label text; `advance`/`delete` emitted with the correct task id via `onAdvance`/`onDelete` props (role/name query via `screen.getByRole('button', { name: ... })`, not a CSS selector); Advance disabled once `status === 'done'`; Advance enabled for `backlog`/`in_progress` (table-driven); Delete never disabled regardless of status.
+
+`tests/components/register-page.spec.ts` (3 tests) - the "form/display component": no dedicated `FormXxx.vue` exists yet in this codebase (every form is written directly inside its page), so `register.vue` was used directly as the only genuine "disabled while saving" behavior available, with `useAuthStore` mocked via `mockNuxtImport` (a controllable `vi.fn()` for `register`, plus the full shape `auth.global.ts`'s middleware needs - see gap below). Covers: submit button shows "Creating account…" and is disabled while the (manually-controlled) promise is pending; success message with the real registered email once resolved, button re-enabled; accessible error alert (`role="alert"`) with the real thrown message on failure, button re-enabled.
+
+Switched from plain `@vue/test-utils` (`mountSuspended` + CSS-selector `wrapper.find`) to `@testing-library/vue`'s `renderSuspended`/`screen`/`fireEvent` partway through this step, after discovering Vue Test Utils has no `getByRole` at all (confirmed by grepping its own type declarations - zero matches) - real role/name accessible querying, which the module explicitly asks for, requires Testing Library, not just VTU. Added as a new devDependency for this reason, documented rather than faked with a CSS-selector workaround.
+
+**Step 5 - API client tests**
+
+`tests/services/api-client.spec.ts` (10 tests), the real `createApiClient` exercised with a fake `fetcher` (`vi.fn()`) and fake `getAccessToken`/`refresh`/`onAuthFailure` callbacks - never mocking `request()` itself. Covers every item the module names: base URL + bearer header attached (and *not* attached when there's no token); method/body forwarded exactly; GET is the default method; a normal success returns the fetcher's result unchanged; a first 401 refreshes exactly once and retries with the new token (asserted on the actual retry header, not just "didn't throw" - see gap #6 above); refresh failure calls `onAuthFailure` exactly once and rejects with the *original* 401, normalized; a second 401 after an already-refreshed retry does not call `refresh` again and does not call `onAuthFailure` (the retry's 401 falls straight to `normalizeError`, never re-entering the refresh branch at all); a non-401 error is normalized without ever touching `refresh`. Added one test beyond the module's minimum list, directly verifying a design property the client's own source comment claims but nothing had ever checked: two concurrent 401s share exactly one in-flight refresh (not one each).
+
+**Step 6 - auth middleware test**
+
+`tests/nuxt/auth-middleware.spec.ts` (6 tests). Picked "auth middleware redirect" over the log-out-on-network-failure alternative, since it's the one Step-1 risk that genuinely needs Nuxt route context - exactly what this step is for. `defineNuxtRouteMiddleware(fn)` just returns `fn` unchanged (confirmed by reading Nuxt's own source expectations - it's a typing/registration wrapper, not a runtime transform), so the default export was imported and called directly with fake `to`/`from` route objects; `useAuthStore` and `navigateTo` mocked via `mockNuxtImport`. Covers: unauthenticated visitor to `/dashboard` redirected to `/login?redirect=/dashboard`; same for a nested protected path (`/projects/5`); authenticated visitor on a protected route is not redirected; authenticated visitor on `/login` is sent to `/dashboard`; unauthenticated guest on `/login` is left alone; `initAuth()` is always awaited to completion before any redirect decision is made (asserted via call-order, not just call-count).
+
+Real, honestly-disclosed environment limitation: the `if (import.meta.server) return` guard at the top of the middleware has no automated coverage here - `import.meta.server` is a Vite-time constant baked into the `nuxt` Vitest environment's client-mode build, not something this test can flip per-case. It's a single trivial early-return statement, and was already manually re-verified live via `curl` in Module 11 for the equivalent client-only routes; that manual check, not a test, is what backs this specific branch today.
+
+**Step 7 - mutation drill**
+
+Three mutations, one at a time, narrow tests run, restored, `git diff` confirmed clean before moving to the next:
+
+*Mutation 1 - reverse the status label* (`app/utils/labels.ts`, swapped `'Backlog'`/`'Done'` between the `backlog`/`done` keys):
+
+```text
+FAILED tests/unit/labels.spec.ts > statusLabel > maps backlog to exactly Backlog
+FAILED tests/unit/labels.spec.ts > statusLabel > maps done to exactly Done
+2 failed, 11 passed
+```
+
+Caught cleanly at the dedicated pure-unit layer. `TaskCard.spec.ts`'s 7 tests all still passed unaffected - its one status-text assertion uses `in_progress` (untouched by this mutation), and its disabled-state assertions key off the raw `task.status` value, not the label text. Confirmed this is correct layering, not a gap: `docs/testing-strategy.md` explicitly says not to duplicate every scenario at every layer, and `labels.spec.ts` is already the exhaustive, dedicated owner of this exact contract for all 3 status values. Restored; `git diff` clean.
+
+*Mutation 2 - emit the wrong task ID* (`TaskCard.vue`, `emit('advance', task.id)` → `emit('advance', task.id + 1)`):
+
+```text
+FAILED tests/components/TaskCard.spec.ts > TaskCard > emits advance with the task id when the Advance button is clicked
+AssertionError: expected "vi.fn()" to be called once with arguments: [ 99 ]
+Received: [ 100 ]
+1 failed, 6 passed
+```
+
+Caught immediately and precisely - the failure message shows the exact wrong value received. Restored; `git diff` clean.
+
+*Mutation 3 - let the API client refresh/retry repeatedly* (`api-client.ts`, `if (status === 401 && !isRetry)` → `if (status === 401)`, removing the retry cap):
+
+First attempt at verifying this - running the existing "does not recurse" test as originally written (persistent 401 mock) - **OOM-crashed the test runner** rather than failing cleanly (see gap #7 above; this was itself the most important finding of this step, not a side note). Fixed the test to use a bounded mock (5 rejections then success) - a real, permanent hardening, not a one-off workaround for this drill - then re-ran against the still-active mutation:
+
+```text
+FAILED tests/services/api-client.spec.ts > createApiClient > does not recurse on a second 401 after an already-refreshed retry - refresh runs exactly once
+AssertionError: promise resolved "{ ok: true }" instead of rejecting
+- Expected: Error { "message": "rejected promise" }
++ Received: { "ok": true }
+1 failed, 9 passed
+```
+
+Caught cleanly and safely (84ms) once the mock was bounded - the mutated client kept retrying until the mock's rejections ran out and it finally got a fake 200, exactly proving the removed cap's real-world consequence (a client that would hammer a genuinely-down auth server forever instead of failing fast). Restored the guard; `git diff` clean.
+
+No mutation survived undetected. `git diff --stat frontend/app/` after all three restorations shows only the Step-2-through-6 legitimate changes (labels extraction, priority display, fetcher injection/`normalizeError` export) - confirmed no residual mutation state before the final gate.
+
+**Step 8 - full gate, real output**
+
+```text
+$ docker compose run --rm frontend npm run lint
+> eslint .
+(no output, exit 0)
+
+$ docker compose run --rm frontend npm run typecheck
+> nuxt typecheck
+[Vue] Resolve plugin path failed: vue-router/volar/sfc-route-blocks ... ERR_PACKAGE_PATH_NOT_EXPORTED
+(exit 0 - same benign pre-existing Volar-plugin warning documented in every prior frontend module's log; vue-tsc's own type check is unaffected by it)
+
+$ docker compose run --rm frontend npm test
+ RUN  v4.1.10 /workspace
+
+ ✓ unit  tests/services/api-client.spec.ts (10 tests) 128ms
+ ✓ unit  tests/unit/labels.spec.ts (6 tests) 16ms
+ ✓ unit  tests/unit/date.spec.ts (8 tests) 81ms
+ ✓ unit  tests/unit/normalize-error.spec.ts (8 tests) 14ms
+ ✓ unit  tests/unit/api-error.spec.ts (5 tests) 10ms
+ ✓ nuxt  tests/nuxt/auth-middleware.spec.ts (6 tests) 1804ms
+ ✓ nuxt  tests/components/ErrorAlert.spec.ts (2 tests) 2064ms
+ ✓ nuxt  tests/components/TaskCard.spec.ts (7 tests) 2087ms
+ ✓ nuxt  tests/components/register-page.spec.ts (3 tests) 1668ms
+
+ Test Files  9 passed (9)
+      Tests  55 passed (55)
+   Duration  7.56s (transform 12.38s, setup 1.99s, import 10.89s, tests 7.87s, environment 18.02s)
+(exit 0)
+
+$ docker compose run --rm frontend npm run build
+✔ Client built in 10104ms
+✔ Server built in 8271ms
+[nitro] ℹ Prerendering 1 routes
+[nitro] ℹ Prerendered 2 routes in 3.063 seconds
+Σ Total size: 4.7 MB (1.2 MB gzip)
+✨ Build complete!
+(exit 0)
+```
+
+All four real, current, run in this session - no result asserted without the command output backing it up in the same turn.
+
+Also updated `Makefile`'s `frontend-test` target to run `npm test` alongside the pre-existing `npm run typecheck` (previously the only frontend check wired into `make test`), matching the `backend-test`/pytest pattern already established - a real test runner existing and not being wired into the project's own gate would be a gap in itself.
+
+**Independent challenge - accessibility-focused component test**
+
+Implemented for real (`tests/components/ErrorAlert.spec.ts`, 2 tests), not deferred to a design note. Verifies `ErrorAlert` exposes its message through `role="alert"` (queried via `screen.getByRole('alert')`, a real accessible-role query, not a CSS class check) with both the default and a custom title, for both the default-title and custom-title cases.
+
+What this test actually proves: `role="alert"` implicitly carries `aria-live="assertive"` and `aria-atomic="true"` per the ARIA spec - a conforming screen reader announces an element with this role the instant it enters (or changes within) the accessibility tree, with no separate `aria-live` wiring required. Querying by role/name instead of a CSS selector proves the accessible contract a real assistive-technology user depends on genuinely exists in the rendered DOM. This codebase's error alerts are whole-form errors (login/register failure), not single-field ones, so `role="alert"` is the correct association mechanism here rather than `aria-describedby` - which this codebase already uses correctly elsewhere for a genuinely single-field case (`register.vue`'s password hint, `aria-describedby="register-password-hint"`, confirmed by reading the real markup).
+
+What this test cannot prove, and still needs a real browser/manual assistive-technology review:
+- Whether an actual screen reader (NVDA/JAWS/VoiceOver) really announces this element on mount versus only on a later *change* - some real AT implementations only announce live-region content that changes after initial page load, not content present at first paint. `happy-dom` implements no accessibility tree and speaks nothing at all; it only proves the DOM attribute is present and correctly named, not that anything is actually announced.
+- Focus movement: after a failed submit, focus stays on the submit button; whether a screen-reader user actually notices the alert without focus being moved there programmatically (a `tabindex="-1"` + `.focus()` pattern some forms use) is a real UX judgment call this test doesn't evaluate.
+- Interruption behavior: `role="alert"` is meant to interrupt whatever a screen reader is currently announcing, which is genuinely disruptive if triggered too often (e.g. on every keystroke of a live-validating field) - only a real assistive-technology session can judge whether that's appropriate, not a unit test.
+
+**Failure investigated**
+
+- Symptom: the mutation-drill run for "remove the API client's retry cap" (Step 7, Mutation 3) crashed the Node test process with `FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory` instead of producing a failing test.
+- Smallest reproduction: `createApiClient` with the `!isRetry` guard removed, driven by a fetcher mock that rejects with a 401 unconditionally (`mockRejectedValue`, no call-count bound) and a `refresh` mock that always succeeds.
+- Hypothesis: the recursive `return request<T>(path, init, true)` call, now never gated, recurses once per 401 forever; since each recursive call still goes through a real `await`, it doesn't blow the synchronous call stack (no `RangeError`) - it instead keeps allocating new promise/closure state per iteration indefinitely.
+- Evidence that confirmed it: reran the identical scenario with the fetcher mock bounded to 5 rejections before succeeding - the mutation now produced a clean, fast (84ms), correctly-failing assertion (`promise resolved "{ ok: true }" instead of rejecting`) instead of a crash, confirming the crash was purely a function of the mock's unboundedness combined with the missing cap, not some other interaction.
+- Root cause: a test double with an infinite domain (a mock that never stops producing the same failure) implicitly relies on the code under test to be the thing that terminates the interaction - which is exactly the property the mutation removed. The mock and the guard it was implicitly depending on were never supposed to be tested together this way.
+- Prevention/test added: bounded the "does not recurse" test's fetcher mock to a fixed 5 rejections (permanent fix to the committed test, not a one-off drill workaround) - it still fully proves the real client's cap (which only ever reaches 2 fetcher calls) while remaining safe to execute against any future mutant that touches this guard.
+
+**Decision and tradeoff**
+
+Split the Vitest config into two `projects` (plain `happy-dom` for pure logic, a real `nuxt` environment only for component/route-aware tests) instead of running everything under one Nuxt environment. Alternative considered: a single `environment: 'nuxt'` for every test file, which is simpler to configure and would have worked correctly for all 55 tests. Rejected because it would silently contradict `api-client.ts`'s own explicit design claim ("no Nuxt app context needed") every time those tests ran, and because the timing difference is real and would compound as the suite grows: the `unit` project's 37 tests ran in well under a second of actual test time, while the 5 Nuxt-aware component/middleware tests each took 1.4-2.9s just for environment setup per file. Fits this specific codebase because the module's own architecture (a plain-factory API client, extractable pure label/date/error functions) was already deliberately built to not need Nuxt context - the config should reflect and enforce that property, not paper over it.
+
+**Security, privacy, and operations**
+
+No secrets, credentials, or real backend calls anywhere in this test suite - every network boundary (the API client's fetcher, the auth store's `register`) is a fake `vi.fn()`, never a real `$fetch` against the live backend, so nothing here touches the actual dev database or real user data. The `npm audit` findings surfaced while installing test tooling (gap #9 above) were investigated and confirmed pre-existing/unrelated rather than silently ignored or silently "fixed" by force-bumping a pinned framework version outside its stated range. No new environment variables, no new secrets, no migrations - purely a devDependency and test-file addition plus small, real, documented source fixes (fetcher injection, priority display, label extraction, UTC-pinned date formatting).
+
+**Review feedback**
+
+N/A - no pull request opened yet for this module.
+
+**Remaining uncertainty**
+
+- Whether `frontend/tests/nuxt/` (added for the one Nuxt-aware-but-not-a-component test) is the right permanent home, or whether `docs/testing-strategy.md` should be updated to name that folder explicitly now that a real example exists - noted but not changed, since editing the strategy doc itself felt like a decision worth flagging for review rather than making unilaterally in the same module that first needed it.
+- Whether `TaskCard`'s new priority display and the still-unused `formatDate` utility should be extended further (e.g. actually showing `due_date` on `TaskCard`) is a real product-completeness question, not something this testing module should decide unprompted - flagged, not resolved.
+- The `import.meta.server` early-return branch in `auth.global.ts` (Step 6) has no automated test - whether that's acceptable long-term or worth a dedicated SSR-mode Vitest project of its own is an open question.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - reproducing the workflow directly, would use notes for the risk-map layering table and the exact Vitest/Nuxt test-project configuration details.
+- I can explain it without the reference code: yes - mocking the API client's own request function bypasses the behavior under test entirely, so it would only prove the mock returns what it was told to return, not that the client actually constructs the right headers, forwards the right body, or handles errors correctly. An infinite-domain mock (one that never stops producing the same rejection) is dangerous when combined with mutation testing because a mutation that removes a termination guard turns a finite failure path into genuinely non-terminating work, which crashed the test runner via OOM rather than failing cleanly - the mock and the guard it implicitly depended on were never meant to be exercised together that way. role="alert" is correct for an important, dynamic error that must be announced automatically the moment it appears, since the role itself carries implicit live-region semantics; aria-describedby only associates static descriptive text with a specific control and does not trigger any announcement on its own.
+- I can diagnose one failure in this area: yes - would start with a risk map, define test boundaries and environments deliberately, use fakes only at genuine external boundaries rather than mocking the subject under test, cover SSR/client and accessibility semantics explicitly, then use targeted mutation testing to validate the suite actually catches real regressions rather than just existing.
+- Confidence from 1-5: 5/5 - the main remaining caveat is that real assistive-technology announcement behavior still needs manual screen-reader validation, since semantic markup alone proves the DOM contract exists, not that a real screen reader actually announces it the way the specification implies.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
