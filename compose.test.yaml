@@ -10,6 +10,8 @@ services:
       POSTGRES_DB: workboard_test
       POSTGRES_USER: workboard
       POSTGRES_PASSWORD: test-only-password
+    volumes:
+      - starter-postgres-test-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U workboard -d workboard_test"]
       interval: 3s
@@ -37,6 +39,15 @@ services:
       target: production
     environment:
       NUXT_PUBLIC_API_BASE: http://backend-test:8000/api/v1
+      NUXT_INTERNAL_API_BASE: http://backend-test:8000/api/v1
     depends_on:
       backend-test:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/api/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  starter-postgres-test-data:

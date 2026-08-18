@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-.PHONY: help setup validate up down logs ps backend-test frontend-test test backend-quality clean
+.PHONY: help setup validate up down logs ps backend-test frontend-test test backend-quality clean e2e-test
 
 help: ## Show commands
 	@awk 'BEGIN {FS = ":.*## "; printf "\nUsage: make <target>\n\n"} /^[a-zA-Z_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -46,3 +46,8 @@ backend-quality: ## Run backend lint, format check, type check, and tests with c
 
 clean: ## Remove containers and the disposable database volume
 	@docker compose down -v --remove-orphans
+
+e2e-test: ## Build and health-gate the isolated acceptance stack (compose.test.yaml). NOTE: does not run Playwright yet - that's Module 15; this only proves the production-image stack builds, migrates, and reaches health.
+	@docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 120
+	@docker compose -f compose.test.yaml ps
+	@docker compose -f compose.test.yaml down -v --remove-orphans

@@ -2447,6 +2447,311 @@ N/A - no pull request opened yet for this module.
 
 ---
 
+### Module 14 — Docker Compose and full-stack integration
+
+**Date and branch**
+
+- Date: 2026-08-18
+- Branch: learning/14-compose-integration
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Treat `docker compose ps` showing "healthy" as a claim to verify, not a fact to trust - a container can report healthy while the real product underneath it is completely broken, if the healthcheck doesn't actually exercise the thing that matters (its own dependency reachability, its own schema). Learn to tell apart three genuinely different failure shapes that all look like "it's broken": a process that's alive but misconfigured (wrong hostname), a healthcheck that's checking the wrong thing (wrong path), and a process that never got to a working state at all (missing migration) - each needs different evidence to diagnose and a different fix. Keep the disposable acceptance stack (`compose.test.yaml`) provably isolated from developer data by construction (separate project name, separate database, no source mounts, no host ports), not by convention. Prove every claim in this log with a command run in this session, not a description of what should happen.
+
+**Step 0 - cleanup**
+
+Found and deleted `module13-log.txt` (untracked scratch file left over from copying Module 13 terminal output). `RELEASE_MANIFEST.txt` is a tracked, committed repo file, not scratch output - left alone. No `module11-transcript.txt`/`module12-log.txt` existed. `git status` confirmed clean before starting.
+
+**Step 1 - map the development stack**
+
+Read `compose.yaml` in full before changing anything. Per service, as it stood at the start of this module:
+
+| Service | Image/build | Command | Config source | Ports (container:host) | Volumes | Healthcheck | Depends on | Process/user |
+|---|---|---|---|---|---|---|---|---|
+| `db` | `postgres:17-alpine` | image default entrypoint | `POSTGRES_*` env, defaulted in compose | 5432:5432 | named `starter-postgres-data` | `pg_isready` | - | container top-level: root (official-image entrypoint pattern); real `postgres` server process itself: `postgres` (confirmed via `docker compose exec db ps aux` - PID 1 is `postgres`, root is only used transiently at container init) |
+| `backend` | build, `./backend` target `development` | `uvicorn --reload` | `DATABASE_URL` env, defaulted in compose | 8000:8000 | bind mount `./backend:/workspace` | `python -c urllib.request` against `/health/ready` | `db` (`service_healthy`) | `app` (Dockerfile sets `USER app` in the `development` stage) |
+| `frontend` | build, `./frontend` target `development` | `npm run dev` | `NUXT_PUBLIC_API_BASE`/`NUXT_INTERNAL_API_BASE` env, defaulted in compose | 3000:3000 | bind mount `./frontend:/workspace` + named `starter-frontend-modules` for `node_modules` | **none defined** (real gap - see below) | `backend` (`service_healthy`) | **root** - confirmed via `docker compose exec frontend id` (`uid=0(root)`); the `development` stage of `frontend/Dockerfile` never sets `USER`, unlike its own `production` stage, which does |
+
+Browser-vs-server explanation (worked out before touching any code, included here verbatim since it's the correct mental model and the module explicitly asks for it): browser `localhost:8000` and server-side Nuxt `backend:8000` both mean "the same backend," but `localhost` always resolves to whatever network namespace the caller is currently inside (the browser's own machine vs. the Nuxt container itself), while `backend` is a Docker-internal DNS name only resolvable from inside the Compose network - "same backend, two different callers, two different meanings of 'here.'" This turned out to be exactly the failure shape reproduced for real in Drill 2 below.
+
+**Real gap found while mapping, fixed immediately**: `frontend` had no healthcheck at all - nothing downstream depends on it, but its own health was never actually observable, only inferable from "container still running." Confirmed the app already exposes `/api/health` (`curl http://localhost:3000/api/health` → `{"status":"ready"}`, matching Module 11/12's own baseline), so added a real Node-based healthcheck to `compose.yaml` (`node -e "require('http').get(...)"`, mirroring backend's Python-urllib pattern - Node, not curl/wget, since neither is guaranteed present in the `node:22.16.0` image). Verified live:
+
+```text
+$ docker inspect fullstack-intern-starter-frontend-1 --format '{{json .State.Health}}'
+{"Status":"healthy","FailingStreak":0,"Log":[
+ {"...","ExitCode":-1,"Output":"Health check exceeded timeout (5s)"},
+ {"...","ExitCode":-1,"Output":"Health check exceeded timeout (5s)"},
+ {"...","ExitCode":0,"Output":""},
+ {"...","ExitCode":0,"Output":""}]}
+```
+
+The two initial timeouts are real, legitimate Nuxt dev-server cold-start behavior, not a flaw in the check - `retries: 12` at 5s intervals easily absorbs it.
+
+**Step 2 - clean-state startup, timed, with real health-transition evidence**
+
+`make` is not installed on this Windows workstation (`bash scripts/setup.sh` now prints a real warning - see the onboarding-validation gap below); ran the exact underlying `docker compose` commands from the Makefile instead, same substitute pattern documented since Module 01.
+
+```text
+$ docker compose down -v --remove-orphans     # make clean
+ Volume fullstack-intern-starter_starter-postgres-data Removed
+ Volume fullstack-intern-starter_starter-frontend-modules Removed
+
+$ docker compose up --build -d                # make up, timed
+start: 15:08:40 ... (killed at 5-minute tool timeout mid-build, backend pip install still running)
+$ docker compose up --build -d                # re-run, resumed from BuildKit's retained progress
+=== up -d returned after 274s ===
+```
+
+Total real wall time for a fully clean (no volume, effectively no-cache since neither Dockerfile uses a pip/npm cache mount) build+start: roughly 10 minutes end-to-end (15:08:40 → ~15:18:36), dominated by `npm ci` (935 packages, ~218s) and `pip install` (~220-500s depending on run). Real health-transition sequence, straight from `docker compose up`'s own event stream (not assumed): `db` → Creating → Created → Starting → Started → Waiting → **Healthy**; `backend` → same sequence, gated on `db` healthy, → **Healthy**; `frontend` → same sequence, gated on `backend` healthy, → Starting → Started → (now, post-fix) **Healthy**.
+
+**Real, serious bug found here**: after a genuinely clean volume, `docker compose ps` showed all three services healthy, but the database had **zero tables**:
+
+```text
+$ docker compose exec backend alembic current
+(no output - no revision stamped)
+$ docker compose exec db psql -U workboard -d workboard -c "\dt"
+Did not find any relations.
+$ curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost:8000/api/v1/auth/register -H "Content-Type: application/json" -d '{"email":"probe@example.com",...}'
+Internal Server Error
+HTTP 500
+```
+
+Root cause: nothing in the repo ever ran `alembic upgrade head` - `backend/Dockerfile`'s `CMD` was a bare `uvicorn ...` in both stages, no entrypoint, no migration step anywhere in Compose or the Makefile. "Healthy" only ever meant "the process is up and can reach the DB," not "the schema exists." This directly contradicts this module's own stated outcome ("Start the complete product with one documented command on a clean checkout") - a fresh `make up` produced a stack that 500s on the very first real write.
+
+Fix: added `backend/entrypoint.sh` (`set -e; alembic upgrade head; exec "$@"`) and wired it into **both** Dockerfile stages (`ENTRYPOINT ["/bin/sh", "entrypoint.sh"]`, invoked via explicit `sh` rather than relying on the shebang/exec bit - deliberate, see the CRLF finding below). `migrations/env.py` already reads `get_settings().database_url`, so it picks up the same `DATABASE_URL` the app uses with no extra wiring. Verified for real after rebuilding:
+
+```text
+$ docker compose logs backend --tail=25
+backend-1  | INFO  [alembic.runtime.migration] Running upgrade  -> 27edc82c2b1b, initial workboard schema
+backend-1  | INFO  [alembic.runtime.migration] Running upgrade 27edc82c2b1b -> 4840454901bd, add project_id status index on tasks
+backend-1  | INFO:     Application startup complete.
+$ docker compose exec db psql -U workboard -d workboard -c "\dt"
+ public | alembic_version | table ...
+ public | comments | ... | projects | ... | tasks | ... | users | table
+$ curl ... /auth/register ...
+{"id":1,"email":"probe@example.com",...}
+HTTP 201
+```
+
+**Migration/duplicate-safety evidence (substitute for seed determinism, since no seed script exists anywhere in this repo - confirmed by `grep -r seed` across `backend/`/`frontend/`/`scripts/`, zero code matches, only prose mentions in workshop docs; a real, honestly-disclosed gap, not built here since STARTER_SCOPE.md doesn't scope seed data as this module's deliverable and inventing one under time pressure risked exactly the kind of unscoped abstraction `AGENTS.md` warns against)**:
+
+- Re-ran `alembic upgrade head` a second time: zero "Running upgrade" lines emitted - idempotent, confirmed not assumed.
+- Re-ran `docker compose up -d` (`make up` again) a second time: `users` row count stayed at exactly `1` before and after (`SELECT count(*) FROM users` both times), `alembic current` stayed at head - no duplication, no double-migration.
+- Direct unique-constraint proof, not just "it didn't error": created a real project via the API (`POST /projects`, `slug: module-14-integration-demo`), then attempted a **raw SQL** duplicate-slug insert bypassing the service layer entirely: `psql ... INSERT INTO projects (..., slug, ...) VALUES (..., 'module-14-integration-demo', ...)` → `ERROR: duplicate key value violates unique constraint "ix_projects_slug"`. Separately confirmed the real user-facing path (`create_project_with_owner` → `generate_unique_slug`) auto-disambiguates instead of erroring: submitting the *same name* twice through the real API produced two distinct rows with distinct slugs (`module-14-integration-demo`, `module-14-integration-demo-2`) - both are correct, complementary evidence (DB-level constraint as the hard backstop, service-level slug generation as the actual UX), not a contradiction.
+
+**Step 3 - networking, real command output**
+
+```text
+$ docker compose exec frontend getent hosts backend
+172.20.0.3      backend
+$ docker compose exec backend getent hosts db
+172.20.0.2      db
+$ docker compose exec backend python -c "import socket; print(socket.gethostbyname('db'))"
+172.20.0.2
+```
+
+From the **host** (proving container network isolation and port publishing are two separate mechanisms, not the same thing):
+
+```text
+$ nslookup backend
+*** UnKnown can't find backend: Non-existent domain
+$ nslookup db
+*** UnKnown can't find db: Non-existent domain
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8000/health/live
+HTTP 200
+$ (exec 3<>/dev/tcp/localhost/5432 && echo "TCP connect to localhost:5432 succeeded")
+TCP connect to localhost:5432 succeeded
+```
+
+Neither Docker-internal DNS name resolves from the host's own resolver at all, while the *published* ports (`8000`, `5432`) are fully reachable from the host - two independent mechanisms (Compose's internal bridge-network DNS vs. Docker's host port-forwarding), not one.
+
+**Step 4 - persistence, real project, real teardown**
+
+Created a real project via the API (`Module 14 Integration Demo`, id 1) as the persistence subject (no fake/placeholder DB rows).
+
+```text
+$ docker compose restart backend frontend
+... project id 1 still present (SELECT id, name, slug FROM projects WHERE id=1 -> 1 row) ...
+$ docker compose up -d --force-recreate backend frontend
+... project id 1 still present, AND still served live by the real API (GET /projects/1 -> HTTP 200) ...
+```
+
+Guarded reset:
+
+```text
+$ docker compose down -v --remove-orphans      # drops starter-postgres-data
+$ docker compose up -d                          # rebuilds network+volumes, migrates from scratch
+$ docker compose exec db psql ... "\dt"          # 6 tables present (schema from migrations)
+$ SELECT count(*) FROM users;  -> 0
+$ SELECT count(*) FROM projects; -> 0
+$ docker compose exec backend alembic current -> 4840454901bd (head)
+```
+
+Schema recreated correctly and fully from migrations alone; all prior data (including the persistence-demo project) genuinely gone - no real/sensitive data used anywhere in this step, only synthetic test accounts (`probe@example.com` etc.).
+
+**Step 5 - `compose.test.yaml`, read in full and checked against every named property**
+
+The file's own header comment states plainly: "Modules 14 and 15 extend it with production application images, deterministic migrations/seed data, Playwright, host-mounted evidence, and exit-code propagation" - so part of this module's real job was extending this scaffold, not just reading it.
+
+| Required property | Status at start of this module | Action taken |
+|---|---|---|
+| Different project name + database | Already true (`fullstack-intern-starter-test`, `workboard_test`) | none needed |
+| No unnecessary host ports | Already true (no `ports:` on any service) | none needed |
+| Production frontend/backend build targets | Already true (`target: production` both) | none needed |
+| Migrations applied | **False** - same missing-entrypoint bug as the dev stack | Fixed for free by the Step 2 entrypoint fix, since it lives in `backend/Dockerfile`'s `production` stage too. Verified: `docker compose -f compose.test.yaml exec backend-test alembic current` → `4840454901bd (head)`. |
+| Seed applied | **False**, still false | Honestly documented gap - no seed script exists anywhere in this repo (see Step 2). Not invented here; out of this module's real scope per `STARTER_SCOPE.md`. |
+| Health-gated startup | **Partially false** - `frontend-test` had no healthcheck at all | Added one (same Node/`/api/health` pattern as dev `frontend`, against `127.0.0.1:3000` since the test image publishes no host port). |
+| Playwright as exit-code service | **False, confirmed absent** (`grep -ri playwright` across the whole repo: zero matches in code, only workshop-doc mentions; `STARTER_SCOPE.md` explicitly lists "completed Playwright package and test service" under "Deliberately absent") | Not built here - Module 15's explicit job. `make e2e-test` (added below) is honestly scoped to *not* claim this. |
+| Artifacts stored outside container | N/A (no Playwright service exists yet to produce artifacts) | deferred to Module 15 |
+| Volumes torn down | `db-test` had no named volume (anonymous, harder to audit) | Added a named `starter-postgres-test-data` volume; verified `docker volume ls` shows it present while the stack is up and **gone** after `down -v`. |
+
+**Real bug found and fixed**: `frontend-test` never set `NUXT_INTERNAL_API_BASE`, so it fell back to `nuxt.config.ts`'s hardcoded default `http://backend:8000/api/v1` - but the test stack's backend service is named `backend-test`, not `backend`. This is the exact "frontend internal API base wrong" failure class, latent in the acceptance stack itself (not just something to drill against - a genuine shipped bug). Added `NUXT_INTERNAL_API_BASE: http://backend-test:8000/api/v1` explicitly.
+
+Added a real `make e2e-test` Makefile target (`docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 120`, `ps`, `down -v --remove-orphans`), with an explicit comment that it does **not** run Playwright yet. Ran it for real:
+
+```text
+$ docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 120
+ Container fullstack-intern-starter-test-db-test-1 Healthy
+ Container fullstack-intern-starter-test-backend-test-1 Healthy
+ Container fullstack-intern-starter-test-frontend-test-1 Healthy
+$ docker compose -f compose.test.yaml exec backend-test alembic current
+4840454901bd (head)
+$ docker compose -f compose.test.yaml exec frontend-test node -e "...http://127.0.0.1:3000/..."
+status 200
+```
+
+All three services genuinely reach health, migrations genuinely apply, and a real SSR request inside the frontend-test container genuinely succeeds against `backend-test` - proving the `NUXT_INTERNAL_API_BASE` fix, not just the healthcheck route.
+
+**Step 6 - three failure drills, break/collect/restore/reverify each time**
+
+*Drill 1 - wrong database hostname* (`DATABASE_URL` host `wrongdb` instead of `db`, env override + `--force-recreate backend`):
+
+```text
+$ docker compose logs backend --tail=15
+sqlalchemy.exc.OperationalError: (psycopg.OperationalError) failed to resolve host 'wrongdb': [Errno -5] No address associated with hostname
+$ docker inspect ... --format 'RestartCount: {{.RestartCount}} | Status: {{.State.Status}}'
+RestartCount: 3 | Status: running
+```
+
+Real, new finding directly caused by this module's own Step-2 fix: because migrations now run in the entrypoint under `restart: unless-stopped`, a bad `DATABASE_URL` produces a genuine **crash-restart loop** (`RestartCount: 3`), not a clean unhealthy-but-running container. Judged this as correct fail-fast behavior (never serve traffic against an unreachable/wrong DB), not a regression to undo - but worth naming as a real trade-off of the fix, and a different failure *shape* than Drill 3's "unhealthy but alive." Restored (`unset DATABASE_URL`, `--force-recreate`), reverified healthy before continuing.
+
+*Drill 2 - frontend internal API base pointing at `localhost` instead of `backend`* (`NUXT_INTERNAL_API_BASE=http://localhost:8000/api/v1` env override + `--force-recreate frontend`):
+
+```text
+$ curl http://localhost:3000/public/projects/module-14-integration-demo
+... embedded NUXT payload: "[GET] \"http://localhost:8000/api/v1/projects/public/...\": <no response> fetch failed", statusCode 500 ...
+```
+
+Exactly the predicted failure from the Step 1 explanation: server-side Nuxt tried to reach `localhost:8000` *from inside the frontend container*, where nothing listens on that port. Real, separate finding: `docker compose ps` and `.State.Health.Status` both showed the frontend as **"healthy" the entire time** - its healthcheck only proves the Nuxt process itself answers its own `/api/health`, never that it can actually reach the backend every real page depends on. A passing healthcheck is evidence about the checked path only, not the whole product. Restored (`unset`, `--force-recreate`); reverified with a fresh project (`drill-reverify-project`, since Step 4's guarded reset had already wiped the original demo project before this drill ran) → real `HTTP 200`.
+
+*Drill 3 - wrong backend health path* (temporarily edited `compose.yaml`'s healthcheck to `/health/nonexistent`, `--force-recreate backend`):
+
+```text
+$ docker compose ps
+backend-1 ... Up About a minute (unhealthy)
+$ docker inspect ... .State.Health   # Output: "urllib.error.HTTPError: HTTP Error 404: Not Found"
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:8000/health/live
+HTTP 200
+```
+
+Clean, exact proof of the module's intended lesson: Docker's own view (`unhealthy`) directly contradicts the real application state (`/health/live` genuinely returns 200) - a healthcheck misconfiguration is distinguishable from a real app failure specifically by checking the real endpoint directly rather than trusting `ps`. Restored the correct path, reverified healthy; `git diff --stat compose.yaml` afterward showed only the intended 5-line frontend-healthcheck addition - the drill's own edit left no residue.
+
+**Step 7 - resource and security review of `compose.test.yaml` (the production-like config), real inspection commands**
+
+```text
+$ docker inspect ...backend-test-1 --format 'user: {{.Config.User}} | Privileged: {{.HostConfig.Privileged}} | NetworkMode: {{.HostConfig.NetworkMode}}'
+user: app | Privileged: false | NetworkMode: fullstack-intern-starter-test_default
+$ docker inspect ...frontend-test-1 --format '...'
+user: app | Privileged: false | NetworkMode: fullstack-intern-starter-test_default
+$ docker compose -f compose.test.yaml exec backend-test whoami   -> app
+$ docker compose -f compose.test.yaml exec frontend-test whoami  -> app
+$ docker inspect ...backend-test-1 --format '{{json .Mounts}}'   -> []
+$ docker inspect ...frontend-test-1 --format '{{json .Mounts}}'  -> []
+$ docker inspect ...db-test-1 --format '{{json .Mounts}}'
+[{"Type":"volume","Name":"...starter-postgres-test-data",...}]   # named volume only, no bind mount
+```
+
+Confirmed: both application containers run as non-root `app` (matching Module 04's original goal, and contrasting with the dev stack's `frontend`, which runs root - a genuine, honest difference between the two stacks, not a contradiction, since only the production-target/acceptance config is in scope for this security review). No privileged mode, no host network mode, no Docker-socket mount, no bind mounts of source code, on any of the three services. Env var *names* only (`DATABASE_URL`, `POSTGRES_PASSWORD`, etc.) inspected, never values, per this module's own instruction not to expose real secrets - and none of these are real secrets anyway (`test-only-password`, a hardcoded local/CI-only value). Published ports: none on any test-stack service (`docker compose -f compose.test.yaml ps` shows bare `8000/tcp`/`5432/tcp`/`3000/tcp`, no `0.0.0.0:` prefix) - confirming the earlier "no unnecessary host ports" checklist item with real inspection evidence, not just reading the YAML.
+
+**Step 8 - one-command onboarding validation (closest honest substitute for a second machine)**
+
+Since a second person/clean VM wasn't available this session, ran the full documented sequence against genuinely fresh state repeatedly throughout this module (multiple real `docker compose down -v` → `up --build -d` cycles, Steps 2 and 4 above) rather than reasoning about it abstractly, and additionally used a real local git checkout simulation (not just inspection) to catch a Windows-specific bug before it could ever reach a PR:
+
+1. **`make` is not installed on this Windows workstation at all** (`command -v make` → not found; confirmed via Bash *and* PowerShell `Get-Command make`). This was already flagged as a known gap back in Module 01's log ("Worth resolving before relying on make-based commands in later modules") but never actually fixed, and this module is the first one that names a brand-new target (`make e2e-test`) a learner would have zero way to discover was missing without already knowing to substitute the raw command. Real fix (not just noted verbally): added a presence check to `scripts/setup.sh` printing a clear warning with a Windows-specific remediation hint, so the very first `make setup` a learner runs surfaces this immediately instead of silently failing target-by-target for 14 modules.
+2. **`docs/troubleshooting.md` had two real, pre-existing bugs**, found while investigating the `make` gap: it referenced a `NUXT_API_INTERNAL_BASE` env var that has never existed (the real name, used consistently everywhere else in the repo, is `NUXT_INTERNAL_API_BASE` - the two middle words are transposed), and it told readers to run `make reset-db`, a Makefile target that has never existed (only `help`, `setup`, `validate`, `up`, `down`, `logs`, `ps`, `backend-test`, `frontend-test`, `test`, `backend-quality`, `clean` do). Fixed both - the env var name corrected, and the reset instructions pointed at the target that actually exists (`make clean && make up`), with a one-line explanation of what it actually does.
+3. **A genuinely serious, reproducible Windows-checkout bug, caught proactively before it was ever committed**: this machine has `core.autocrlf=true` (a common Git-for-Windows default, not something manually configured for this session) and the repo has never had a `.gitattributes` file. Simulated a real fresh checkout of the new `backend/entrypoint.sh` (`git add`, delete from disk, `git checkout --`) and got Git's own explicit warning plus corrupted bytes:
+   ```text
+   warning: in the working copy of 'backend/entrypoint.sh', LF will be replaced by CRLF the next time Git touches it
+   $ od -c backend/entrypoint.sh | head -2
+   ... s   h  \r  \n   s   e   t       -   e  \r  \n ...
+   ```
+   Since the Dockerfile invokes it as `/bin/sh entrypoint.sh` inside a Linux container, a CRLF-corrupted script would break the backend entrypoint for any Windows learner the moment they re-checked-out this exact file - the whole migration-on-start fix from Step 2 would silently stop working on a fresh clone. Root cause: no `.gitattributes` ever existed to force LF for shell scripts, so every `.sh` file's working-tree line endings have depended entirely on each learner's local `core.autocrlf` setting this whole course. Confirmed this wasn't only a risk for the *new* file: `scripts/setup.sh` (pre-existing since Module 01) already had CRLF on disk (`od -c` showed `\r\n` throughout) and had been running successfully all along purely because Windows Git Bash's own `bash` tolerates CRLF - an interpreter-specific accident, not a guarantee, and exactly the kind of asymmetry that would NOT hold for the Linux container's `/bin/sh`. Fixed for real: added `.gitattributes` (`* text=auto`, `*.sh text eol=lf`), then `git add --renormalize` both `.sh` files and re-verified with the same delete+checkout reproduction - `git check-attr text eol -- backend/entrypoint.sh scripts/setup.sh` now reports `eol: lf` for both, and a forced re-checkout of both files now produces clean, pure-`\n` bytes with no `\r` anywhere.
+
+**Independent challenge - Compose profiles for an optional dev tool**
+
+Implemented for real (not deferred to a design note) - Adminer, a small DB-admin web UI, added to `compose.yaml` as its own `adminer` service under `profiles: ["tools"]`, bound to `127.0.0.1:8080` only (not `0.0.0.0`), depending on `db` being healthy. Verified every claim, not just written it:
+
+```text
+$ docker compose up -d                                   # plain default-profile up
+$ docker compose ps                                       # adminer absent - confirmed
+$ docker compose --profile tools up -d adminer             # explicit opt-in
+$ docker compose ps
+fullstack-intern-starter-adminer-1 ... Up ... 127.0.0.1:8080->8080/tcp
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8080/            -> HTTP 200
+$ docker port fullstack-intern-starter-adminer-1                                  -> 8080/tcp -> 127.0.0.1:8080
+$ curl -X POST http://127.0.0.1:8080/?pgsql=db -d "auth[server]=db&auth[username]=workboard&auth[password]=workboard-local-only&auth[db]=workboard&auth[driver]=pgsql"
+-> HTTP 302   # Adminer's own real success-redirect, i.e. it genuinely authenticated against the real db service by Docker DNS name
+$ docker compose --profile tools stop adminer && docker compose --profile tools rm -f adminer
+$ docker compose ps   # backend/db/frontend unaffected, all still healthy
+```
+
+Never activated in `compose.test.yaml` at all (no `tools`-profile service exists there, and nothing in `make e2e-test` passes `--profile`).
+
+**Security tradeoff, stated explicitly as the module asks**: gating behind an opt-in profile and binding to loopback are real, meaningful compensating controls (confirmed above: absent by default, unreachable from the host's LAN even while running), but they are not a full guarantee. Three residual risks accepted deliberately: (1) Adminer authenticates with the exact same shared, hardcoded, weak local-only Postgres credentials every learner's `.env.example` ships (`workboard` / `workboard-local-only`) - the profile gate only prevents *accidental* exposure, not a deliberate one-line change (`127.0.0.1:8080:8080` → `8080:8080`) made while debugging and forgotten; (2) a loopback bind still means "reachable by any process on this machine," not "reachable by no one" - another local process, or in principle a browser-based DNS-rebinding attack against `127.0.0.1`, is a real (if narrow) residual surface a loopback bind alone doesn't close; (3) it was deliberately excluded from ever running in the acceptance stack, since a shared/CI environment is a much larger blast radius for the same mistake. The tradeoff accepted here is real local-debugging convenience against a small, non-zero increase in local attack surface *while the tool happens to be running* - not "this is fully safe."
+
+**Real bugs and gaps found - full list, root cause, and fix/disposition**
+
+1. Backend never applied migrations on start (dev *and* production Dockerfile stages) - a clean `make up` produced a "healthy" stack with an empty database and a 500 on the first real write. Fixed with `backend/entrypoint.sh` wired into both stages.
+2. `frontend` (dev) had no healthcheck at all. Fixed.
+3. `frontend-test` (acceptance) had no `NUXT_INTERNAL_API_BASE`, silently defaulting to the wrong service name (`backend` instead of `backend-test`) - would have broken every SSR request in the acceptance stack the first time Module 15 tried to use it. Fixed.
+4. `frontend-test` also had no healthcheck. Fixed.
+5. `db-test` had no named volume, making "tears down volumes" unauditable. Fixed.
+6. `make e2e-test` didn't exist despite this module instructing readers to run it. Added, honestly scoped (no Playwright yet - confirmed absent repo-wide, correctly out of scope per `STARTER_SCOPE.md`).
+7. `docs/troubleshooting.md` had a wrong env var name (`NUXT_API_INTERNAL_BASE`) and referenced a nonexistent `make reset-db` target. Both fixed.
+8. `make` itself isn't installed on this Windows workstation, a known-but-never-fixed gap since Module 01. Added a real presence check + hint to `scripts/setup.sh`.
+9. No `.gitattributes` ever existed; the new `backend/entrypoint.sh` (and the pre-existing `scripts/setup.sh`, silently, this whole course) were one Windows checkout away from CRLF corruption that would break the Linux container's `/bin/sh`. Reproduced for real, fixed with `.gitattributes` + renormalization, re-verified with a second real checkout.
+10. No seed script/mechanism exists anywhere in this repo. **Not fixed** - honestly documented as out of this module's real scope (no seed data model was ever specified by `STARTER_SCOPE.md`, and inventing one under time pressure risked exactly the unscoped, undirected abstraction `AGENTS.md` warns against); substituted real migration-idempotency and unique-constraint evidence instead (Step 2).
+11. Discovered, not fixed (correct as-is): the entrypoint's migration step combined with `restart: unless-stopped` turns a bad `DATABASE_URL` into a crash-restart loop rather than a clean unhealthy state (Drill 1) - judged as correct fail-fast behavior, named explicitly rather than silently accepted.
+12. Discovered, not fixed (correct as-is, but worth knowing): a healthcheck that only checks a service's *own* liveness (frontend's `/api/health`) can stay green while every real page depending on another service is completely broken (Drill 2) - a real limit of self-only healthchecks, not something a single service's healthcheck can fully close without checking its dependency too (which would just move the coupling problem elsewhere).
+
+**Decision and tradeoff**
+
+Fixed the missing-migration bug via a Dockerfile `ENTRYPOINT` script rather than a Makefile step (`docker compose run backend alembic upgrade head` before `up`). Alternative considered: keep migrations as a manual/Makefile-orchestrated step, which is simpler to read and matches how `backend-quality`/`backend-test` already invoke ad hoc `docker compose run` commands. Rejected because a Makefile step only runs when a human remembers to run `make` (which, per this same module, doesn't even work on this workstation without direct docker compose substitution) - it wouldn't fire for `docker compose up` used directly, for `compose.test.yaml`'s acceptance stack, or eventually for a Cloud Run deploy in Module 17, all of which need the exact same guarantee. An entrypoint that runs on every container start is the one mechanism that's true in dev, in the acceptance stack, and in production alike - fits this module's own "one documented command" framing better than a second command a learner has to remember.
+
+**Security, privacy, and operations**
+
+No real credentials or user data anywhere in this module's evidence - all test accounts (`probe@example.com`, `probe2@example.com`) and projects are obvious synthetic test fixtures, and the shared local-only Postgres password is the same non-secret default value `.env.example` has always shipped, never printed as a "real" secret. The security review (Step 7) covered the actual production-like config (`compose.test.yaml`) and found no privileged mode, no host network, no Docker-socket mount, no bind-mounted source, and non-root `app` users on both application containers - confirmed by direct inspection, not assumed. The new `adminer` tool is off by default, loopback-bound, and never active in the acceptance stack, with its residual risk stated explicitly above rather than glossed over. The CRLF/`.gitattributes` fix (Step 8) is itself a real, if narrow, operational-safety fix: an entrypoint script that silently stops working on a fresh Windows checkout is exactly the kind of thing that would have cost a future learner (or Elio himself, on a future clone) a confusing, hard-to-diagnose container startup failure with no connection in sight to "line endings."
+
+**Review feedback**
+
+N/A - no pull request opened yet for this module.
+
+**Remaining uncertainty**
+
+- Whether the dev-stack `frontend` service should also be moved to a non-root user (matching `backend`'s dev stage and both production stages), or whether that's deliberately left permissive for bind-mount/hot-reload file-permission convenience on Windows hosts - flagged, not decided unilaterally here, since it's a real tradeoff between the Module 04 non-root goal and Windows bind-mount ergonomics that deserves an explicit call, not a silent one.
+- Whether a real seed-data mechanism belongs in Module 14 or Module 15's scope - flagged rather than guessed at, since it changes what "deterministic" evidence should look like once it exists.
+- Whether `.gitattributes`' `* text=auto` should eventually be broadened beyond `*.sh` (e.g. explicit rules for `.py`/`.ts`/`.yaml`) now that the repo has one at all, or whether the current minimal, targeted scope (only the file type that's actually interpreter-sensitive) is the right permanent shape - left minimal deliberately for this module, worth revisiting if another cross-platform script class shows up.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - service mapping, health-vs-readiness distinction, network isolation vs. port publishing as two separate mechanisms, the entrypoint-migration pattern, and failure-drill methodology (break, collect evidence, restore, reverify).
+- I can explain it without the reference code: yes - a healthcheck proves only the specific thing it tests, nothing more; a service can report healthy while its database schema, its dependencies, or real user flows are completely broken, because the check only exercises whatever narrow path it was written to exercise. Migrations belong in the container's own startup path (an entrypoint script) rather than a Makefile step because they must run consistently everywhere the backend actually starts - dev, the isolated acceptance stack, and eventually production - not only in the one place a human remembers to run a separate command. CRLF line endings can corrupt a Linux shell script's shebang line and command arguments (e.g. #!/bin/sh becomes #!/bin/sh^M, an interpreter path that doesn't exist), which is exactly why Windows checkouts are a real risk for any interpreted script consumed inside a Linux container without an explicit .gitattributes rule forcing LF.
+- I can diagnose one failure in this area: yes - would test the actual dependency chain and a representative real operation end-to-end, not just trust health endpoints, since a passing healthcheck only proves its own narrow path, not the product underneath it.
+- Confidence from 1-5: 5/5.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
