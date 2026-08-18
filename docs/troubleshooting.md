@@ -36,7 +36,7 @@ Check database health, connection URL host (`db`, not `localhost` inside backend
 Determine where the request originates:
 
 - browser request uses `NUXT_PUBLIC_API_BASE` and must be reachable from the host/browser;
-- server-side Nuxt request uses `NUXT_API_INTERNAL_BASE` and should use Docker DNS locally.
+- server-side Nuxt request uses `NUXT_INTERNAL_API_BASE` and should use Docker DNS locally.
 
 Inspect browser network, frontend logs, backend CORS logs/response, and runtime config without printing secrets.
 
@@ -45,10 +45,10 @@ Inspect browser network, frontend logs, backend CORS logs/response, and runtime 
 ```bash
 docker compose exec backend alembic current
 docker compose exec backend alembic history
-make reset-db
+make clean && make up
 ```
 
-Reset only disposable local data. Never treat volume deletion as a production migration strategy.
+`make clean` drops the disposable Postgres volume (and only that data); `make up` rebuilds and reapplies migrations from scratch. Reset only disposable local data. Never treat volume deletion as a production migration strategy.
 
 ## Backend
 

@@ -13,6 +13,11 @@ done
 
 docker compose version >/dev/null
 
+if ! command -v make >/dev/null 2>&1; then
+  echo "Warning: 'make' is not on PATH. Makefile targets (make up, make test, ...) will not run." >&2
+  echo "  Windows/Git Bash: install GNU Make (e.g. 'choco install make' or via MSYS2/WSL) or run the underlying docker compose commands from the Makefile directly." >&2
+fi
+
 if [[ ! -f .env ]]; then
   cp .env.example .env
   echo "Created .env from .env.example"

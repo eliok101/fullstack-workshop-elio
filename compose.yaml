@@ -53,6 +53,29 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # Optional database UI. Off by default - only starts with
+  # `docker compose --profile tools up -d adminer`, never via a plain
+  # `docker compose up` and never in compose.test.yaml (the acceptance
+  # stack has no `tools` profile service and never activates one).
+  # Bound to 127.0.0.1 only, not 0.0.0.0, so it is unreachable from other
+  # machines on the host's network even while running - see
+  # docs/troubleshooting.md's Compose section / this module's learning log
+  # entry for the security tradeoff this still accepts.
+  adminer:
+    image: adminer:4.8.1
+    profiles: ["tools"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
