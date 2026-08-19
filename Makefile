@@ -47,7 +47,9 @@ backend-quality: ## Run backend lint, format check, type check, and tests with c
 clean: ## Remove containers and the disposable database volume
 	@docker compose down -v --remove-orphans
 
-e2e-test: ## Build and health-gate the isolated acceptance stack (compose.test.yaml). NOTE: does not run Playwright yet - that's Module 15; this only proves the production-image stack builds, migrates, and reaches health.
-	@docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 120
-	@docker compose -f compose.test.yaml ps
-	@docker compose -f compose.test.yaml down -v --remove-orphans
+e2e-test: ## Build the acceptance stack, run the real Playwright suite (Chromium) against it, and tear down - exit code reflects the test run, not just whether the stack came up
+	@docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 120 db-test backend-test frontend-test
+	@docker compose -f compose.test.yaml run --rm e2e; \
+	code=$$?; \
+	docker compose -f compose.test.yaml down -v --remove-orphans; \
+	exit $$code

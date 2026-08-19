@@ -1,8 +1,12 @@
 name: fullstack-intern-starter-test
 
-# This is the acceptance-stack scaffold. Modules 14 and 15 extend it with
-# production application images, deterministic migrations/seed data, Playwright,
-# host-mounted evidence, and exit-code propagation.
+# This is the acceptance-stack scaffold. Module 14 added production
+# application images and migrations-on-start (see backend/entrypoint.sh).
+# Module 15 adds the `e2e` Playwright service below: real browser/API tests
+# against these exact production images and this exact PostgreSQL instance,
+# host-mounted evidence, and exit-code propagation (see `make e2e-test`).
+# Deterministic seed data is still an open gap - see Module 14's learning
+# log entry ("no seed script exists anywhere in this repo").
 services:
   db-test:
     image: postgres:17-alpine
@@ -24,6 +28,16 @@ services:
       target: production
     environment:
       DATABASE_URL: postgresql+psycopg://workboard:test-only-password@db-test:5432/workboard_test
+      # Real gap found via this module's own browser-driven E2E suite: the
+      # dev stack (compose.yaml) never sets this either, but has always
+      # worked purely by coincidence - a browser on the host reaches the dev
+      # frontend at http://localhost:3000, which happens to match the
+      # backend's hardcoded default cors_origins exactly. The acceptance
+      # stack's browser (this module's `e2e` service) runs *inside* the
+      # Docker network and reaches frontend-test at its Docker DNS name, a
+      # different Origin the default never allowed - invisible to curl/the
+      # `request` fixture, since only a real browser enforces CORS at all.
+      CORS_ORIGINS: '["http://frontend-test:3000"]'
     depends_on:
       db-test:
         condition: service_healthy
@@ -39,7 +53,7 @@ services:
       target: production
     environment:
       NUXT_PUBLIC_API_BASE: http://backend-test:8000/api/v1
-      NUXT_INTERNAL_API_BASE: http://backend-test:8000/api/v1
+      NUXT_API_INTERNAL_BASE: http://backend-test:8000/api/v1
     depends_on:
       backend-test:
         condition: service_healthy
@@ -48,6 +62,26 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+
+  # Not started by a plain `up` (no other service depends on it) - run
+  # deliberately via `docker compose -f compose.test.yaml run --rm e2e` (see
+  # `make e2e-test`) so its real process exit code propagates to the caller,
+  # rather than being swallowed the way a background `up`-started service's
+  # exit code would be.
+  e2e:
+    build:
+      context: ./e2e
+    environment:
+      E2E_BASE_URL: http://frontend-test:3000
+      E2E_API_BASE_URL: http://backend-test:8000/api/v1
+    depends_on:
+      frontend-test:
+        condition: service_healthy
+    # Host-mounted so the report/trace survive `down -v` - evidence from a
+    # failing run must outlive the disposable stack it was produced against.
+    volumes:
+      - ./e2e/playwright-report:/workspace/playwright-report
+      - ./e2e/test-results:/workspace/test-results
 
 volumes:
   starter-postgres-test-data:

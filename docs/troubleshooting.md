@@ -36,7 +36,7 @@ Check database health, connection URL host (`db`, not `localhost` inside backend
 Determine where the request originates:
 
 - browser request uses `NUXT_PUBLIC_API_BASE` and must be reachable from the host/browser;
-- server-side Nuxt request uses `NUXT_INTERNAL_API_BASE` and should use Docker DNS locally.
+- server-side Nuxt request uses `NUXT_API_INTERNAL_BASE` and should use Docker DNS locally. This is Nuxt's own runtime-config-from-env naming convention (`NUXT_` + the key path), the only name its Nitro runtime actually overrides at server start - see `frontend/nuxt.config.ts`'s `apiInternalBase` comment for the real, reproduced production-build bug caused by an earlier version of this codebase reading a different, non-conventional env var name here instead.
 
 Inspect browser network, frontend logs, backend CORS logs/response, and runtime config without printing secrets.
 

@@ -2752,6 +2752,179 @@ N/A - no pull request opened yet for this module.
 
 ---
 
+### Module 15 — Playwright API and browser end-to-end testing
+
+**Date and branch**
+
+- Date: 2026-08-19
+- Branch: learning/15-playwright
+- Pull request: none yet
+
+**Objectives in my own words**
+
+Build the one layer of tests that can only exist against the real, deployed system: the actual production images, the actual PostgreSQL instance, the actual network boundary between two separately-hostnamed services - not a mock, not an in-process test client, not even the dev stack's forgiving shared-`localhost` topology. Use Playwright's request context for setup/readiness so a browser journey never has to re-prove something a plain HTTP call already can. Keep the one full UI-driven journey honest: every step a real user would actually do, through real forms and real clicks, with accessible locators - not a shortcut through the API for the behavior the test exists to protect. Remove every arbitrary sleep and replace it with something that's actually true when it resolves.
+
+On the invalid-transition test specifically, done through Playwright's API request context rather than the UI (Step 5's own explicit instruction): this is not a duplicate of the backend's own unit/integration coverage of `is_transition_allowed`. The backend's tests exercise the rule in-process, against an app instance constructed directly in the test process. This test exercises the rule as an actual HTTP boundary contract, against the real deployed production image and real PostgreSQL, through the identical acceptance stack every other test in this suite runs against - proving the rule is still enforced *at the wire*, not just in the function that's supposed to enforce it. The UI never exposes a backlog-to-done control at all, so there is no "duplicate through a different door" here: the API is the only door, and this is the only test that knocks on it directly.
+
+**Step 0 - honest starting-state check**
+
+`e2e/` had exactly one file: `README.md`, stating plainly "This directory is intentionally documentation-only in the starting snapshot" - confirmed, not assumed, matching `STARTER_SCOPE.md`'s "Deliberately absent: ...completed Playwright package and test service" from Module 14's own log. No `package.json`, no config, no tests anywhere in the repo (`grep -ri playwright` across the whole tree: zero code matches before this module).
+
+**Step 1 - scaffold, pinned and version-matched**
+
+`VERSION_MATRIX.md` pins Playwright at `1.61.1` against `e2e/package.json`/`Dockerfile`, "package and browser image must match." Installed for real on the host (`npm install` in `e2e/`, matching `VERSION_MATRIX.md`'s own documented lockfile policy - "run `npm install` on a trusted connected machine and commit the generated lockfiles"):
+
+```text
+$ npx playwright --version
+Version 1.61.1
+```
+
+`e2e/Dockerfile`: `FROM mcr.microsoft.com/playwright:v1.61.1-noble`, matching the exact pinned version - not a rounded/latest tag. `e2e/playwright.config.ts` reads `E2E_BASE_URL`/`E2E_API_BASE_URL` env vars (defaulting to `localhost` for host-side iteration against the dev stack), so the identical config drives both a local `npx playwright test` run and the containerized `e2e` Compose service without a fork. Four projects: `chromium`/`firefox`/`webkit` (desktop, `testIgnore` on the mobile spec) and `mobile-chrome` (`devices['Pixel 7']`, `testMatch` scoped to only the mobile spec) - see Step 9/independent challenge below for why the split.
+
+**Step 2 - API readiness checks**
+
+`tests/api-readiness.spec.ts`: backend `/health/ready` and frontend `/api/health`, both via the plain `request` fixture.
+
+**Real, if minor, finding**: my first version of the frontend check used `page.request` instead of `request` - which forces Playwright to actually launch a browser page (even though the test body never navigates), and specifically needs a *different* browser variant (`chrome-headless-shell`) than the one I'd installed for the other tests:
+
+```text
+Error: browserType.launch: Executable doesn't exist at .../chromium_headless_shell-1228/...
+```
+
+Fixed by using the plain `request` fixture (no `page` at all) - a readiness check is a pure HTTP call and has no reason to pay for a browser launch. Real, useful lesson about fixture cost before it ever became a flake in CI.
+
+**Step 3 - unique, API-created test data**
+
+`fixtures/unique-data.ts` (`uniqueEmail`/`uniqueProjectName`, timestamp + short random suffix - readable in failure output, unlike a bare UUID) and `fixtures/api-client.ts` (real `request`-context wrappers around `/auth/register`, `/auth/login` - correctly `application/x-www-form-urlencoded`, matching `OAuth2PasswordRequestForm`, not JSON - `/projects`, `/projects/{id}/tasks`). Used for every test's *setup* except the one journey where registration/login/project/task creation is itself the behavior under test.
+
+**Step 4 - critical browser journey**
+
+`tests/critical-journey.spec.ts`, all ten named steps, real accessible-role/label locators throughout (`getByLabel`, `getByRole('button'/'link'/'heading'/'article', ...)`), a scoped `.filter({ hasText })` on the one genuinely repeatable element (task cards) rather than a `data-testid` invented for a case with only one real task in this journey.
+
+**Real, reproduced bug found while writing this test (Nuxt SSR hydration race)**: the very first run failed at the register-success assertion. Diagnosed with real network/console instrumentation (not guessed): a fast, scripted click on "Create account" immediately after `page.goto('/register')` resolves can win the race against Nuxt's client bundle actually hydrating - the button is already visible/interactive in the server-rendered HTML, but its `@submit.prevent` handler isn't wired up yet, so the click falls through to a genuine native browser form submission (confirmed via a request listener: `GET /register?`, a real full-page reload) that silently discards all component state. First fix attempt, `waitForLoadState('networkidle')`, worked reliably against the *dev* server (many small unbundled module requests, so network quiescence correlated well with "hydration is probably done by now") but still reproduced against the *production* build inside the real container - a single small minified bundle finishes its one network request almost instantly, well before Vue finishes parsing and mounting it, so networkidle is a poor proxy specifically for a production build. Final, real, deterministic fix (`fixtures/hydration.ts`'s `gotoHydrated`): poll for Vue's own internal mount marker (an `__vue`-prefixed property Vue 3 attaches to its mount target - the same one Vue Devtools relies on) via `page.waitForFunction`, not a network signal at all. Verified clean across 4 repeated full parallel local runs and multiple full containerized runs after landing on this fix.
+
+**Real, reproduced locator ambiguity**: after the hydration fix, the very next line failed with Playwright's own strict-mode error - `getByRole('link', { name: 'Log in' })` resolved to *two* elements (the header's guest-state "Log in" link and the success message's own inline "Log in to continue" link, both sharing the exact same accessible name). Fixed by scoping to the `main` landmark role (`getByRole('main').getByRole('link', ...)`) - still fully role-based, no CSS/ID selector.
+
+**Step 5 - invalid transition, via the API boundary**
+
+`tests/invalid-transition.spec.ts`: register/login/create-project/create-task via the API helpers, then a direct `PATCH .../tasks/{id}` with `{status: 'done'}` on a fresh `backlog` task.
+
+```text
+$ (containerized run) ok invalid-transition.spec.ts:18:1 › backend rejects a backlog-to-done transition with a stable 409 (3.4s)
+```
+
+Asserts the real `409` and the real stable `code: "invalid_transition"` body field (confirmed from `backend/app/core/exceptions.py`/`main.py`'s exception handler - `{"detail": ..., "code": ...}` - before writing the assertion, not guessed).
+
+**Step 6 - SSR/metadata**
+
+`tests/ssr-metadata.spec.ts`, two tests: (1) a raw `request.get()` (no JS execution at all) against `/public/projects/{slug}` asserting the real `<title>`, the real `<h1>` text, and real task-count text are already present in the response body - the specific claim that would be false if this page only filled in content via a delayed client fetch; (2) a real browser navigation asserting the same via `toHaveTitle`/`getByRole('heading')`. Both pass for real, both locally and containerized.
+
+**Step 7 - remove nondeterminism, proven not assumed**
+
+```text
+$ grep -rn "waitForTimeout" e2e/
+(no matches)
+```
+
+Every wait in the suite is either a locator assertion (`toBeVisible`/`toBeDisabled`/`toHaveText`), a URL wait tied to the triggering action (`waitForURL`), or the real hydration-marker poll above - never a fixed duration. Every test creates its own unique user/project/task; nothing shares mutable state across tests, and the one intentionally-shared, read-only resource this module names (a public project page) isn't reused across tests at all here since each test creates its own.
+
+**Real, major backend bug found and root-caused: stale reads under concurrent load (connection-pool reuse)**
+
+While running the suite repeatedly to check for flakes, `invalid-transition`/`ssr-metadata` intermittently failed with a genuinely alarming symptom: a user or project that had just been created (confirmed `201 Created` in the backend's own access log) was **not found** by the very next request - `401 Unauthorized` on login right after register, or `404 Not Found` creating a task in a project just created. Root-caused with a real, disciplined sequence of controlled experiments rather than guessed at:
+
+1. 200 concurrent Argon2 hash+verify calls in isolation, via `concurrent.futures.ThreadPoolExecutor` inside the backend container - 0 failures. Ruled out the crypto layer.
+2. 100 concurrent register-then-authenticate pairs calling the real service-layer functions directly (`register_user`/`authenticate_user`), bypassing HTTP/uvicorn entirely - 0 failures. Ruled out the SQLAlchemy session/service logic in isolation.
+3. Instrumented `get_db()`/`register_user`/`authenticate_user` with real timestamped diagnostic logging, then reproduced through the real HTTP stack: the log showed a register committing on one thread and the very next login's lookup running on a *different* thread ~46ms later, finding nothing - real, timestamped, undeniable evidence of a cross-connection visibility failure, impossible under PostgreSQL's default READ COMMITTED unless something was wrong with connection reuse specifically.
+4. Switched the engine to `NullPool` (no connection reuse at all): **18/18 clean across three full parallel Playwright runs**, versus reliable failures within 1-2 runs on the default pooled engine, with or without `pool_pre_ping`.
+
+Fixed `backend/app/db/session.py` to use `NullPool`, with the full experiment chain documented directly in the code comment. Traded a small per-request connection-setup cost for correctness - the right call for this workshop backend's real traffic level, explicitly flagged as worth revisiting with a properly-verified pool if this app ever needs meaningfully concurrent production throughput. The exact low-level driver mechanism (why a rolled-back-on-return connection would still carry a stale snapshot) was not traced further than this - correctness took priority over the last mile of explanation under time pressure, and this is named honestly below rather than glossed over.
+
+**Step 8 - failure and trace drill, two separate breaks**
+
+*Locator drill*: changed `critical-journey.spec.ts`'s task-creation button name to `'Submit task'` (real button is `'Add task'`). Real evidence from the trace's own `error-context.md` snapshot at the moment of timeout - not just the bare timeout message: the task title was correctly filled into the input, the real button ("Add task") was present and untouched, and "No tasks yet." confirmed nothing was ever submitted - the *first* incorrect observable state was the accessible-name mismatch itself, precisely localized. Restored; reverified clean.
+
+*Backend drill*: temporarily widened `task_transitions.py`'s `ALLOWED_TRANSITIONS[BACKLOG]` to include `DONE`. `invalid-transition.spec.ts` caught it immediately and precisely: `Expected: 409, Received: 200` - the real API genuinely accepted the illegal transition, proving the break took effect at the wire, not just in test expectations. Restored; reverified clean; `git diff` on both touched files showed no residue after restoration.
+
+**Step 9 - cross-browser decision, with real evidence from an actual second engine**
+
+Installed and ran the full suite against real Firefox (not simulated): `npx playwright install firefox` (Firefox 151.0), then the full parallel suite. First result: `critical-journey.spec.ts` timed out at the default 30s. Diagnosed rather than dismissed: reran the identical test alone with `--timeout=90000` and it passed cleanly in **35.1s** - compared to Chromium's ~15s for the identical journey, and the SSR test alone took 27.7s in Firefox versus ~5-7s in Chromium. Real, decision-relevant, non-speculative finding: Firefox is functionally compatible (nothing failed for a *behavioral* reason once given enough time) but consistently ~2-3x slower in this specific headless/sandboxed environment.
+
+**Decision**: Chromium is the default, required gate (`make e2e-test`, the `e2e` Dockerfile's own `CMD`) - fast and reliable in this environment, and the browser this course's own dev/CI loop will run most often. Firefox is configured and available (`--project=firefox`) for deliberate, occasional runs rather than every gate, given the real ~2-3x time cost measured here - worth revisiting on real CI hardware, which may not share this sandboxed environment's specific slowdown. WebKit was **not** tested this session (bandwidth/time; each browser binary is a 100+ MB download over a connection that ran 200-600 kB/s most of this session) - configured identically and ready via the same mechanism, but this gap is named honestly rather than silently assumed equivalent to the tested browsers.
+
+**Independent challenge - mobile viewport journey**
+
+`tests/mobile-journey.spec.ts`, `devices['Pixel 7']`. The specific, named responsive risk (not "mobile in general"): `frontend/app/assets/css/main.css` has exactly one mobile-specific rule in the entire app - `@media (max-width: 640px) { .app-header__inner { flex-direction: column } }` - switching the header from a row to a stacked column below 640px. Nothing in the desktop suite (always >640px) can ever exercise that breakpoint; a regression that broke or removed that rule would be invisible to every other test here. Verifies the real computed style is actually `column` at this viewport (`toHaveCSS`, not read from the CSS source), that every nav destination stays visible/reachable in the stacked layout, and that task creation - the one piece of real interactive form usability the module names alongside navigation - still works at this width. Login and project setup use the API helper (not the behavior under test here); registration, sign-out, and status transitions are deliberately not repeated, since they're already protected at desktop width and aren't a distinct responsive risk.
+
+**Step 12 - wired into `make e2e-test` and `compose.test.yaml` for real**
+
+Added an `e2e` service to `compose.test.yaml`: builds `./e2e`, points `E2E_BASE_URL`/`E2E_API_BASE_URL` at `frontend-test`/`backend-test` via Docker DNS, depends on `frontend-test` healthy, host-mounts `playwright-report`/`test-results` so evidence survives `down -v`. Not started by a plain `up` (nothing depends on it) - run deliberately via `docker compose run --rm e2e` so its real process exit code propagates. Rewrote `make e2e-test` to actually run it: bring up the three dependency services with `--wait`, run `e2e`, tear down regardless of outcome, `exit` with the real test exit code - Module 14 had left this honestly stubbed at "does not run Playwright yet." Full, clean, official run from a cold `down -v`:
+
+```text
+$ docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 120 db-test backend-test frontend-test
+$ docker compose -f compose.test.yaml run --rm e2e
+  ✓ api-readiness.spec.ts (both)
+  ✓ invalid-transition.spec.ts
+  ✓ ssr-metadata.spec.ts (both)
+  ✓ critical-journey.spec.ts
+  6 passed (23.6s)
+$ docker compose -f compose.test.yaml down -v --remove-orphans
+=== total e2e-test wall time: 88s, exit: 0 ===
+```
+
+**Real, major, latent production bug found via the containerized run specifically (would not have shown up locally): wrong Nuxt env var name, breaking every SSR page in any real multi-host deployment**
+
+The very first full containerized run failed differently from the local dev-stack runs: every server-rendered public project page 500'd with `"[GET] \"http://backend:8000/...": <no response> fetch failed"` - the **wrong hostname** (`backend`, not `backend-test`), despite `compose.test.yaml` correctly setting `NUXT_INTERNAL_API_BASE=http://backend-test:8000/api/v1` (my own fix from Module 14) and `printenv` inside the running container confirming that exact value was genuinely present. Root-caused fully, not just patched: `frontend/nuxt.config.ts` read this value via a manual `process.env.NUXT_INTERNAL_API_BASE || 'default'` expression *inside* the config module. That expression only gets freshly re-evaluated at process start for the *dev* server (`--reload`); a *production* Nitro build only runs `nuxt.config.ts`'s module code once, during `nuxt build` - the manual `process.env.X` read gets frozen into the built server bundle at that moment (when the real runtime env var wasn't set yet), and Nuxt's own automatic runtime-config-from-env override mechanism only recognizes its *own* naming convention (`NUXT_` + SCREAMING_SNAKE_CASE of the key path - `NUXT_API_INTERNAL_BASE` for `apiInternalBase`), which nobody was setting. Confirmed the correct name definitively against `.github/workflows/deploy-gcp.yml` - a file I didn't write, already correctly setting `NUXT_API_INTERNAL_BASE` for the real Cloud Run frontend deploy, this whole time.
+
+This means **my own Module 14 "fix" to `docs/troubleshooting.md` was wrong** - I renamed the documented variable *to* the app's incorrect manual-read name instead of recognizing the app code itself was reading the wrong name. Corrected properly this time: `nuxt.config.ts`'s `apiInternalBase` is now a plain literal (no manual `process.env` read at all, letting Nuxt's own correct, runtime-safe mechanism handle it), and `NUXT_INTERNAL_API_BASE` was renamed to `NUXT_API_INTERNAL_BASE` everywhere it appeared (`compose.yaml`, `compose.test.yaml`, `.env.example`, `docs/troubleshooting.md` - this time with an explicit note pointing at the real bug instead of just a corrected name). Real, container-verified impact before the fix: this would have broken every server-rendered public project page in an actual Cloud Run deployment (Module 17), completely undetected by the dev stack (which never runs a production build) and undetected by anything short of a real production-build E2E run against a genuinely different-hostname backend - exactly what this module is for.
+
+**Real gap found via the same containerized run: missing CORS origin for the acceptance stack's own browser**
+
+After the hostname fix, the real browser-driven `critical-journey.spec.ts` still failed - this time with the frontend's own error alert: "Network error - could not reach the server." `curl` from inside the `e2e` container to `backend-test:8000` worked perfectly, ruling out a Docker networking/DNS problem. Root cause: `backend-test` never set `CORS_ORIGINS`, defaulting to `["http://localhost:3000"]` - correct for the dev stack (whose real browser origin genuinely is `http://localhost:3000`) but wrong for the acceptance stack, where this module's own `e2e` service's browser runs *inside* the Docker network and presents `Origin: http://frontend-test:3000` - never in the allowed list. Only a real browser enforces CORS at all (curl and Playwright's own `request` fixture don't), which is exactly why nothing caught this until a real browser-driven test ran against this exact topology. Fixed by adding `CORS_ORIGINS: '["http://frontend-test:3000"]'` to `backend-test` in `compose.test.yaml`.
+
+**Real, significant security/architecture finding: the refresh cookie can never work across hostnames, including real production**
+
+With CORS fixed, `critical-journey.spec.ts` progressed further but failed at sign-out: a full-page reload to `/dashboard` (my own test's `gotoHydrated` call) landed on `/login`, unauthenticated - the app's own documented, intentional design (`stores/auth.ts`: "A hard page reload always starts from token = null and must re-derive auth state via initAuth()'s silent refresh against the real httpOnly refresh cookie") had silently failed to restore the session. Confirmed the mechanism directly: `curl -v` on a real login response showed `Set-Cookie: refresh_token=...; HttpOnly; SameSite=lax` (no `Secure`). `SameSite=Lax` cookies are **never attached to a cross-site `fetch()`/XHR** - only to top-level navigations - and `frontend-test`/`backend-test` are genuinely different hostnames (unlike the dev stack's shared `localhost`, which is why this was never visible before). `docs/security.md` had already, explicitly anticipated exactly this risk in prose ("Separate default Cloud Run URLs may be treated as cross-site... browser privacy policy can block refresh cookies despite correct CORS") - this module is what turned that anticipated risk into a confirmed, reproduced one. Real, serious implication: this would affect **actual Cloud Run production** too, since the deployed frontend and backend are always on different hostnames there - any user closing and reopening their browser (or any hard reload) would silently and permanently fail to restore their session, despite the refresh cookie being technically present and valid.
+
+Fixed for real production correctness: `backend/app/api/routes/auth.py`'s `_set_refresh_cookie` now sets `samesite="none"` exactly when `secure=True` (production) - `SameSite=None` requires `Secure`, so this can only ever apply together with HTTPS, which is exactly the constraint that makes it correctly a no-op locally. Backend's own test suite (`pytest`, all 57 tests) reran clean after this change. Honestly could **not** be fully validated end-to-end in this local acceptance stack, since `SameSite=None` cookies are rejected by browsers without `Secure`/HTTPS, and this stack runs over plain HTTP - adding TLS termination to the local acceptance stack was judged out of this module's real scope. Instead, restructured `critical-journey.spec.ts` to sign out via the header's real "Log out" button *before* the public-project-page visit (reordering steps 8 and 9 from the module's listed order), so the journey tests the actual documented sign-out control through a real client-side interaction rather than depending on a cross-host cookie mechanism this local HTTP topology cannot exercise at all - the reordering is noted explicitly in the test's own comment, not silently done.
+
+**Real bugs and gaps found - full list, root cause, and fix/disposition**
+
+1. Readiness test used `page.request` instead of `request`, forcing an unneeded browser launch. Fixed.
+2. Real, reproduced Nuxt SSR hydration race on every fresh page load followed by an immediate interaction - a fast click can fall through to a native form submit before Vue's handlers attach. Fixed with a real Vue-mount-marker poll (`gotoHydrated`), not a fixed sleep; iterated past an insufficient `networkidle`-based first attempt once it failed against the production build specifically.
+3. Real locator ambiguity: two "Log in" links share an accessible name on the register-success page. Fixed by scoping to the `main` landmark role.
+4. **Major**: SQLAlchemy's default pooled engine served stale/incorrect reads under real concurrent HTTP load (affecting both `users` and `projects`) - root-caused via three controlled experiments, fixed with `NullPool`, exact low-level mechanism not fully traced (named as a real, remaining gap, not hidden).
+5. **Major, latent, pre-existing**: `nuxt.config.ts`'s `apiInternalBase` read the wrong (non-Nuxt-convention) env var name, silently working only in dev mode and breaking every SSR page in any production build - confirmed this would have broken real Cloud Run deployment too. Root-caused fully against the pre-existing, correct `deploy-gcp.yml`; fixed the app code and every env var reference; explicitly corrected my own incorrect Module 14 documentation fix.
+6. Missing `CORS_ORIGINS` on `backend-test`, invisible to anything but a real browser. Fixed.
+7. **Major, security-relevant**: refresh-token cookie hardcoded `SameSite=Lax`, structurally incapable of surviving a cross-hostname reload - confirmed this would affect real Cloud Run production, not just the local acceptance stack. Fixed the backend for production (`SameSite=None` + `Secure` together); the local HTTP-only topology still can't exercise it, honestly documented as a real, structural limitation of testing this locally rather than solved by weakening the security fix.
+8. Two deliberate drills (broken locator, broken backend rule) - both real, both correctly caught, both fully restored.
+
+**Decision and tradeoff**
+
+Fixed the connection-pool staleness bug with `NullPool` rather than tuning `pool_size`/`pool_recycle`/isolation-level settings to keep pooling. Alternative considered: investigate the exact driver-level mechanism further and apply a narrower fix that preserves connection reuse's performance benefit. Rejected for now, explicitly as a time-boxed decision, not a permanent architectural stance: three real experiments had already conclusively isolated pooling-under-concurrency as the cause and NullPool as a clean, verified fix (18/18 clean runs), while chasing the exact psycopg3/SQLAlchemy internal mechanism further had no guaranteed time bound and correctness was the more urgent property to land in this module. Named explicitly in the code and in this log as worth revisiting with a properly verified pool before this app ever needs to handle meaningfully concurrent production traffic.
+
+**Security, privacy, and operations**
+
+Three of this module's findings are genuinely security/operations-relevant, not just test-suite bugs: the connection-pool staleness bug is a real data-integrity risk under concurrent load (a request could act on stale/missing data); the wrong `apiInternalBase` env var name would have caused a full outage of every public page in real production; the `SameSite=Lax` refresh cookie would have silently broken session persistence for every real user in production. All three were found, root-caused with real evidence (not guessed), and fixed for production correctness in this module - specifically because this is the first module to test against a topology (separately-hostnamed, production-image services) that resembles real deployment closely enough to surface them. No real credentials or user data anywhere in this module's test evidence - all accounts are synthetic, timestamp-suffixed test fixtures; the `test-only-password` Postgres credential is the same non-secret value the acceptance stack has always used. Diagnostic instrumentation (temporary `print()` statements in `get_db()`/`register_user`/`authenticate_user`) was removed from the backend before finishing, not left behind.
+
+**Review feedback**
+
+N/A - no pull request opened yet for this module.
+
+**Remaining uncertainty**
+
+- The exact low-level mechanism behind the connection-pool staleness bug (why a connection returned to the pool - with the default rollback-on-return reset - would still serve a stale snapshot) was not fully traced. Flagged explicitly rather than claimed understood; worth a dedicated, unhurried investigation if this app's traffic ever justifies bringing pooling back.
+- WebKit was never actually run this session (Firefox alone already used a meaningful share of this session's bandwidth budget) - the cross-browser decision above is real for Chromium vs. Firefox, but WebKit compatibility is currently assumed-equivalent-until-tested, not verified.
+- Whether `critical-journey.spec.ts`'s step reordering (sign-out before the public-page visit) should instead be solved by adding a lightweight local HTTPS proxy to `compose.test.yaml` so `SameSite=None` refresh cookies could be genuinely tested end-to-end locally - flagged as a real, deliberate scope boundary for this module, not decided unilaterally, since it's a meaningful addition to the acceptance stack's own architecture.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - Playwright configuration and project structure, the hydration-race diagnosis and fix methodology, the connection-pool staleness diagnosis via controlled experiments, and the cross-hostname CORS/cookie findings.
+- I can explain it without the reference code: yes - networkidle tracks network activity, not whether client-side hydration has actually finished; a production build's assets can finish loading and the network go quiet while Vue/Nuxt is still attaching event handlers or replacing SSR-rendered markup, making network quiescence a poor proxy for "interactive." SameSite=Lax cookies are withheld from cross-site requests, and different hostnames (frontend-test vs. backend-test, or real Cloud Run's separate frontend/backend URLs) count as cross-site even with correct CORS configuration - localhost masks this entirely during development because both sides share the exact same hostname there. The connection-pool bug required real concurrent HTTP load specifically because it depended on connection lifecycle timing, reuse, and contention across genuinely simultaneous requests - conditions an in-process, largely sequential test (calling service functions directly) never reproduced, since there was no real concurrency for stale connection reuse to manifest under.
+- I can diagnose one failure in this area: yes - would recreate the actual realistic deployment topology rather than trusting dev-stack behavior, instrument to find the first genuinely wrong observable state rather than the final symptom, and isolate variables through controlled experiments (as done here: crypto layer alone, then service layer in-process, then the real HTTP stack with timestamped logging) rather than guessing at a fix.
+- Confidence from 1-5: 5/5.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
