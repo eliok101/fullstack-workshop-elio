@@ -21,12 +21,24 @@ REFRESH_COOKIE_NAME = "refresh_token"
 
 def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
     settings = get_settings()
+    is_secure = settings.environment == "production"
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
         value=refresh_token,
         httponly=True,
-        secure=settings.environment == "production",
-        samesite="lax",
+        secure=is_secure,
+        # docs/security.md already flagged this: "Separate default Cloud Run
+        # URLs may be treated as cross-site... browser privacy policy can
+        # block refresh cookies despite correct CORS." Confirmed for real via
+        # Module 15's E2E suite - frontend and backend on different Docker
+        # hostnames (frontend-test/backend-test, mirroring separate Cloud Run
+        # service URLs) never sent this cookie on the refresh fetch at all
+        # under `samesite="lax"`, since Lax cookies are only attached to
+        # top-level navigations, never to a cross-site fetch()/XHR. `None`
+        # requires `Secure` (HTTPS-only, hence tied to the same production
+        # check) - browsers reject `SameSite=None` without it, so this can't
+        # be applied outside production without also serving HTTPS locally.
+        samesite="none" if is_secure else "lax",
         max_age=settings.refresh_token_expire_days * 24 * 60 * 60,
         path="/api/v1/auth",
     )

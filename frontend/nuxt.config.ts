@@ -8,7 +8,24 @@ export default defineNuxtConfig({
     // backend over the Docker Compose network (service DNS name), never sent to
     // the browser. Falls back to the same Docker DNS name used in compose.yaml
     // so `nuxt typecheck`/local tooling has a sane default outside Compose.
-    apiInternalBase: process.env.NUXT_INTERNAL_API_BASE || 'http://backend:8000/api/v1',
+    //
+    // Deliberately a plain literal, not `process.env.X || default`: Nuxt's own
+    // runtime-config-from-env mechanism already overrides this key at server
+    // startup from `NUXT_API_INTERNAL_BASE` (its real naming convention -
+    // NUXT_ + SCREAMING_SNAKE_CASE of the key path - confirmed against
+    // .github/workflows/deploy-gcp.yml, which has always set exactly that
+    // name for the deployed Cloud Run frontend). A manual `process.env.X`
+    // read here only works when nuxt.config.ts itself gets re-evaluated at
+    // process start (true for the dev server), not for a production Nitro
+    // build, where this module only runs once during `nuxt build` and the
+    // expression's result is frozen into the built server bundle - any env
+    // var read this way reflects build time, not the running container.
+    // Real, reproduced impact before this fix: every server-rendered public
+    // project page 500'd in the production build (compose.test.yaml's
+    // frontend-test, and would have in real Cloud Run deployment too) with
+    // "fetch failed" against the wrong host, despite the correct value being
+    // set under the wrong env var name the whole time.
+    apiInternalBase: 'http://backend:8000/api/v1',
     public: {
       // Shipped into the client bundle and readable by anyone viewing the page
       // source - the browser calls the backend directly at this address, so it
