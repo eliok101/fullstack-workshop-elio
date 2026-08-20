@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-.PHONY: help setup validate up down logs ps backend-test frontend-test test backend-quality clean e2e-test
+.PHONY: help setup validate up down logs ps backend-test frontend-test test backend-quality clean e2e-test verify
 
 help: ## Show commands
 	@awk 'BEGIN {FS = ":.*## "; printf "\nUsage: make <target>\n\n"} /^[a-zA-Z_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -53,3 +53,23 @@ e2e-test: ## Build the acceptance stack, run the real Playwright suite (Chromium
 	code=$$?; \
 	docker compose -f compose.test.yaml down -v --remove-orphans; \
 	exit $$code
+
+verify: ## Run the same checks CI runs (backend and frontend jobs), so a local pass means the pushed commit should pass too - does not include the e2e job (see make e2e-test) or the real Postgres/CORS/cross-host conditions only the acceptance stack reproduces
+	@echo "--- backend: migrations ---"
+	@docker compose run --rm backend alembic upgrade head
+	@echo "--- backend: lint ---"
+	@docker compose run --rm backend ruff check .
+	@echo "--- backend: format check ---"
+	@docker compose run --rm backend ruff format --check .
+	@echo "--- backend: type check ---"
+	@docker compose run --rm backend python -m mypy app
+	@echo "--- backend: test ---"
+	@docker compose run --rm backend pytest
+	@echo "--- frontend: lint ---"
+	@docker compose run --rm frontend npm run lint
+	@echo "--- frontend: type check ---"
+	@docker compose run --rm frontend npm run typecheck
+	@echo "--- frontend: test ---"
+	@docker compose run --rm frontend npm test
+	@echo "--- frontend: build ---"
+	@docker compose run --rm frontend npm run build

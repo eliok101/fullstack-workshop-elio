@@ -30,6 +30,7 @@ Versions are deliberately bounded or pinned so the workshop is reproducible. The
 | Docker setup-buildx | v4 | CI | Major tag |
 | Docker build-push | v7 | CI | Major tag |
 | Upload artifact | v7 | CI | Major tag |
+| dorny/paths-filter | v3 | CI | Major tag; third-party (not a `github-actions`/`docker`/`google-github-actions` org action) - reviewed before pinning |
 
 ## Lockfile policy
 

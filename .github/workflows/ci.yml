@@ -14,44 +14,189 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+            frontend:
+              - 'frontend/**'
+            infra:
+              - '.github/workflows/**'
+              - 'compose*.yaml'
+              - '**/Dockerfile'
+              - '**/.dockerignore'
+              - 'e2e/**'
+
   backend:
     name: Starter backend
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: workboard
+          POSTGRES_PASSWORD: ci-only-not-a-real-secret
+          POSTGRES_DB: workboard_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://workboard:ci-only-not-a-real-secret@localhost:5432/workboard_ci
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      - name: Install and validate
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install dependencies
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-          ruff check .
-          ruff format --check .
-          pytest
+      - name: Run database migrations
+        working-directory: backend
+        run: alembic upgrade head
+      - name: Lint
+        working-directory: backend
+        run: ruff check .
+      - name: Format check
+        working-directory: backend
+        run: ruff format --check .
+      - name: Type check
+        working-directory: backend
+        run: python -m mypy app
+      - name: Test
+        working-directory: backend
+        run: pytest
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Backend - ${{ job.status }}"
+            echo "Python 3.13 against a real \`postgres:17-alpine\` service container: \`alembic upgrade head\`, ruff (lint + format), mypy, pytest."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   frontend:
     name: Starter frontend
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-      - name: Install, typecheck, and build
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
         working-directory: frontend
+        run: npm ci
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+      - name: Type check
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Test
+        working-directory: frontend
+        run: npm test
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+      - name: Job summary
+        if: always()
         run: |
-          npm install
-          npm run typecheck
-          npm run build
+          {
+            echo "### Frontend - ${{ job.status }}"
+            echo "Node 22, \`npm ci\` from the committed lockfile: eslint, nuxt typecheck, vitest, nuxt build."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   containers:
     name: Starter production images
+    needs: [changes, backend, frontend]
+    if: >-
+      always() &&
+      needs.backend.result != 'failure' && needs.backend.result != 'cancelled' &&
+      needs.frontend.result != 'failure' && needs.frontend.result != 'cancelled' &&
+      (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true')
     runs-on: ubuntu-latest
-    needs: [backend, frontend]
     steps:
       - uses: actions/checkout@v7
-      - run: |
+      - name: Confirm the build context cannot ship credentials
+        run: |
+          set -euo pipefail
+          for f in .dockerignore backend/.dockerignore frontend/.dockerignore; do
+            [ -f "$f" ] || { echo "::error file=$f::missing .dockerignore"; exit 1; }
+          done
+          grep -qx '.env' .dockerignore || { echo "::error file=.dockerignore::.env is not excluded from the root build context"; exit 1; }
+          grep -qx '.git' .dockerignore || { echo "::error file=.dockerignore::.git is not excluded from the root build context"; exit 1; }
+          echo "Root, backend, and frontend .dockerignore files all present; .env and .git confirmed excluded."
+      - uses: docker/setup-buildx-action@v4
+      - name: Build production images
+        run: |
           docker build --target production --tag workboard-starter-api ./backend
           docker build --target production --tag workboard-starter-web ./frontend
+
+  e2e:
+    name: Starter end-to-end
+    needs: [changes, containers]
+    if: >-
+      always() &&
+      needs.containers.result != 'failure' && needs.containers.result != 'cancelled' &&
+      (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bring up the acceptance stack
+        run: docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 180 db-test backend-test frontend-test
+      - name: Run Playwright suite
+        id: run
+        run: |
+          set +e
+          docker compose -f compose.test.yaml run --rm e2e
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+      - name: Collect acceptance-stack logs
+        if: always()
+        run: docker compose -f compose.test.yaml logs > compose-test-logs.txt 2>&1
+      - name: Upload Playwright report, traces, and stack logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-evidence
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+            compose-test-logs.txt
+          retention-days: 5
+          if-no-files-found: warn
+      - name: Tear down
+        if: always()
+        run: docker compose -f compose.test.yaml down -v --remove-orphans
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### End-to-end - Playwright exit code ${{ steps.run.outputs.code }}"
+            echo "Report/traces/stack logs uploaded as the \`e2e-evidence\` artifact regardless of outcome (retained 5 days - traces can capture page content)."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Fail the job on a real Playwright failure
+        if: steps.run.outputs.code != '0'
+        run: exit 1
