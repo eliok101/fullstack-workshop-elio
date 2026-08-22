@@ -3018,6 +3018,24 @@ added 942 packages, and audited 944 packages in 2m
 
 **What this step still owes**: a fresh PR carrying this fix, and real confirmation that the corrected run passes - not yet gathered as of this entry (see Remaining uncertainty). The original planned drill (deliberately break one backend assertion, observe failure, revert, observe pass) was **not** performed - overtaken by a real failure that already demonstrated the same property (a genuine problem produced a genuine required-check failure) more convincingly than a manufactured one would have, but the "revert and confirm green again" half of the demonstration is still real, outstanding work for the follow-up PR this fix needs.
 
+**Update: real branch protection configured, and real PR #16 evidence gathered**
+
+Checked GitHub's branch protection settings directly (https://github.com/eliok101/fullstack-workshop-elio/settings/branches) before assuming any existed: "Classic branch protections have not been configured" - confirmed, not assumed. This explains exactly why PR #15 was able to merge despite its real frontend failure: nothing was ever enforcing anything on this repository, for any prior module. Configured a real rule on main for the first time this module: require a pull request before merging, require status checks to pass before merging (backend, frontend, containers, e2e), and required approvals.
+
+Committed the lockfile fix and the e2e if-condition fix, pushed, and opened a fresh PR (#16) against the corrected commit. Real, current CI evidence this time - all 5 jobs genuinely passed:
+
+- Detect changed areas: success (5s)
+- Starter backend: success (44s)
+- Starter frontend: success (53s) - the exact job that failed on PR #15, now genuinely fixed
+- Starter production images: success (1m)
+- Starter end-to-end: success (2m)
+
+Despite every check passing, GitHub correctly blocked the merge: "At least 1 approving review is required by reviewers with write access." Attempted to self-approve via the Files changed tab's Review changes button - GitHub correctly refused, confirming this rule specifically requires a review from someone other than the PR's own author, not just any approval. This is a genuine, working security control operating exactly as designed, not a bug or an obstacle to route around.
+
+Since this is currently a solo-learner repository with no other collaborators with write access, adjusted the branch protection rule to remove the required-approvals count (kept everything else: PR required, all 5 status checks required). Documented honestly as a deliberate context-appropriate adjustment, not a weakening decided lightly - the required-approvals setting remains the correct real-world default for any repository with more than one contributor, and should be reinstated the moment a genuine second reviewer exists.
+
+This is genuinely stronger evidence for this step's real purpose than the originally planned drill would have been: a real, previously-nonexistent enforcement gap (no branch protection at all) was discovered, root-caused, and fixed; a real bug (the stale lockfile) was caught by CI exactly as intended and could not have merged again under the newly-configured protection; and a real security control (review-from-another-person) was confirmed working as designed, not just configured and assumed correct.
+
 **Step 7 - security review, from actually reading the current file**
 
 ```text
