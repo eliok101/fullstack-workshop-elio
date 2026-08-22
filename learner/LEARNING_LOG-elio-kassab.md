@@ -2925,6 +2925,196 @@ N/A - no pull request opened yet for this module.
 
 ---
 
+### Module 16 — GitHub Actions CI and delivery controls
+
+**Date and branch**
+
+- Date: 2026-08-20
+- Branch: learning/16-github-actions
+- Pull request: #15 (merged, but with a genuine `frontend` check failure still showing - see Step 6); this entry's real fix for that failure needs its own follow-up PR, not yet opened as of this entry.
+
+**Objectives in my own words**
+
+Turn `.github/workflows/ci.yml` from the starter's plain lint/test/build pipeline into a real delivery gate: every check a real reviewer would actually want blocking a merge, running against real dependencies (a real PostgreSQL service container, not just SQLite), with real evidence collected on failure, and without wasting runner time re-validating areas a change didn't touch.
+
+The job DAG as it now stands: `changes` (path detection) runs first with no dependencies; `backend` and `frontend` both depend only on `changes` and run in parallel with each other (no reason for one to wait on the other - they touch disjoint parts of the repo and neither's success or failure has any bearing on whether the other's checks are meaningful); `containers` depends on both `backend` and `frontend` (building a production image for code that failed its own tests/lint is wasted runner time, and a real reviewer wouldn't trust a green containers job next to a red backend job anyway); `e2e` depends on `containers` (there's no reason to spin up the full acceptance stack - by far the most expensive job here - against images that don't even build cleanly).
+
+Real PostgreSQL migration validation belongs in CI as a step separate from the fast test suite, not folded into it: the backend's own `pytest` run (SQLite, dependency-overridden) exists specifically to be fast and cheap - it proves the application's *logic* is correct without paying for a real database round trip on every assertion. But SQLite and PostgreSQL are genuinely different databases with different constraint enforcement, different transactional DDL behavior, and different type/dialect semantics (`docs/testing-strategy.md` already names this exact limitation: "SQLite does not reproduce every PostgreSQL behavior"). `alembic upgrade head` against a real, freshly-created `postgres:17-alpine` service container proves something the fast suite structurally cannot: that the actual migration files, in the actual order they'd run in, actually produce a schema PostgreSQL itself accepts - a real production database, not a stand-in.
+
+GitHub Actions service containers use `localhost`, not a Compose-style service hostname, because of what a "job" actually *is* on a GitHub-hosted runner: unlike `compose.yaml`'s `db`/`backend`/`frontend`, which are separate containers on their own Docker network reached by service name, a workflow job's steps all run directly on the runner's own host machine (or inside one container, for a container-based job) - not each inside its own isolated container with its own hostname. A `services:` block runs the service as a sibling container but **publishes its port back to the runner itself**, so from the job's own steps' point of view, the database is just another process reachable at `localhost:5432` - the exact same reason `compose.yaml`'s browser-vs-server distinction doesn't apply here at all; there's only one real network vantage point in a job, not two.
+
+`npm ci` over `npm install` in CI: `npm ci` deletes `node_modules` first and installs *exactly* what `package-lock.json` specifies, refusing to run at all if the lockfile and `package.json` disagree - it never resolves a new dependency graph or silently rewrites the lockfile the way `npm install` can. That makes CI's install step reproducible and honest: the dependency tree CI actually tests is guaranteed to be the exact one that was reviewed and committed, not whatever the freshest-compatible resolution happens to be on a given day. `VERSION_MATRIX.md`'s own "Lockfile policy" section already names this exact transition ("After lockfiles are committed: change Docker and CI installs from `npm install` to `npm ci`") - the frontend lockfile has been committed since Module 01, so this was already due.
+
+**Real, honest correction before starting**: the task description for this module stated the backend/frontend jobs already had `npm ci` and dependency caching applied. Checked, not assumed - `grep -n "cache\|npm ci" .github/workflows/ci.yml` before this module's work found neither; the file still used plain `npm install` and no `cache:` parameter on either `setup-python` or `setup-node`. Not a real bug (nothing was broken), but a real premise mismatch worth naming rather than silently working around - fixed as part of this module's own real work below, not skipped because it was assumed already done.
+
+**Step 4 - `containers` job review and fix**
+
+Confirmed `needs: [changes, backend, frontend]` is correct and unchanged in intent (still only builds once both upstream jobs are known-good, now also respecting the new path-filter skip). Added `docker/setup-buildx-action@v4` (the exact version already pinned in `VERSION_MATRIX.md` - not guessed) before the build steps, so BuildKit is the active builder rather than relying on whatever the runner's Docker daemon defaults to. Added a real credential-leak check step, reusing the existing `.dockerignore` files from Module 04 rather than inventing new ones - confirmed their real content first, not assumed:
+
+```text
+$ cat .dockerignore
+.git
+.env
+**/__pycache__ ...
+$ cat backend/.dockerignore
+__pycache__
+*.py[cod]
+...
+$ cat frontend/.dockerignore
+node_modules
+.nuxt
+...
+```
+
+The new step asserts (and would fail the job with a clear `::error` annotation if not true) that all three `.dockerignore` files exist and that the root one excludes both `.env` and `.git` - a real, mechanical check, not a comment claiming it's fine.
+
+**Step 5 - real `e2e` job**
+
+Added an `e2e` job depending on `containers` (not a fresh, independent build): the acceptance stack's own images are built fresh via `compose.test.yaml`'s `build:` directives regardless (there's no image-passing mechanism between jobs without a registry push, which is Module 17's job, not this one) - `needs: containers` is a real, cheap sequencing gate ("does the plain image build even succeed") before paying for the far more expensive full acceptance-stack-plus-browser run, not a claim that the exact same image layers are reused. Documented this explicitly in the job's own comment rather than leaving the relationship ambiguous.
+
+Brings up `db-test`/`backend-test`/`frontend-test` with `--wait`, runs the real `e2e` service from Module 15 via `docker compose run --rm e2e`, captures its real exit code (`set +e` around the run, `code=$?` into `$GITHUB_OUTPUT`) rather than letting the step's own pass/fail swallow it. `actions/upload-artifact@v7` (`VERSION_MATRIX.md`'s pinned version) runs under `if: always()`, uploading `e2e/playwright-report`, `e2e/test-results`, and a captured `docker compose logs` dump - collected on *every* outcome, not just failure, since a passing run's report is still useful evidence and the module's own instruction was "collect... even when the job fails," which a plain `if: failure()` would satisfy but a genuinely useful CI artifact policy shouldn't be limited to. `retention-days: 5` - short deliberately, per the module's own explicit warning that traces can capture real page content, not the default 90. Teardown (`docker compose -f compose.test.yaml down -v --remove-orphans`) also runs under `if: always()`, so a failed run doesn't leave a stale acceptance stack behind on the runner. The job's actual pass/fail (`exit 1` if the captured code wasn't `0`) is a separate final step, deliberately placed *after* the artifact upload and teardown - if the job failed early via a naive non-zero-exit step, the `if: always()` steps would still run (that's what `always()` means), but keeping the real failure check last and explicit makes the ordering intent readable rather than relying on `always()` semantics being correctly understood by a future reader.
+
+**Step 6 - real required-check demonstration: not the planned drill, something more real happened instead**
+
+This step needed a real, open pull request against `main` for `ci.yml`'s `pull_request:` trigger to fire at all (`push:` is scoped to `branches: [main]` only - confirmed by rereading the workflow's own `on:` block). `gh` CLI is not installed on this workstation and no `GH_TOKEN`/API credential was available to open one via a direct REST call, so this was asked of the user directly rather than guessed around or faked. What actually happened next was not the planned "deliberately break one backend assertion" drill at all: the user opened the PR and **merged it** while this session was occupied with an unrelated side task, without either of us having yet gathered any real run evidence first. Discovered only when a routine `git status` showed the local branch's upstream gone and `origin/main` already containing `Merge pull request #15 from eliok101/learning/16-github-actions`.
+
+Checking what actually happened, rather than assuming the merge meant success, turned up a real, unplanned failure - a genuinely more valuable finding than the planned drill would have been, since it was a real bug rather than a manufactured one:
+
+```text
+$ (GitHub Actions API, unauthenticated, public repo)
+Run 32376116248 - event: pull_request - conclusion: FAILURE - head_sha: fae1951c
+  changes:    success
+  backend:    success
+  frontend:   FAILURE - failed step: "Install dependencies" (npm ci)
+  containers: skipped
+  e2e:        success  <- a second real bug, see below
+```
+
+**Root cause, reproduced locally, not guessed**: `frontend/package-lock.json` was genuinely out of sync with `frontend/package.json` - confirmed by running the exact CI command in an equivalent fresh environment:
+
+```text
+$ docker run --rm -v ".../frontend:/workspace" -w /workspace node:22.16.0 sh -c "npm ci"
+npm error `npm ci` can only install packages when your package.json and package-lock.json ... are in sync.
+npm error Missing: oxc-parser@0.146.0 from lock file
+npm error Missing: @oxc-parser/binding-*@0.146.0 from lock file (18 platform bindings)
+...
+```
+
+`npm install` (used everywhere locally until this module) tolerates a stale lockfile by silently re-resolving and rewriting it - which is exactly why this drift was invisible until `npm ci`'s intentionally strict check ran for the first time, in real CI, this module. This is itself a second, independent confirmation of this module's own stated `npm ci` reasoning (see Objectives above): a workflow that still used `npm install` would never have caught this. Real, honest admission: my own local `make verify` run earlier in this module did **not** catch it either, because the dev container's `node_modules` had already been populated via `npm install` (its Dockerfile's own install step, from before this module), so `make verify`'s checks ran against already-installed packages and never actually exercised a fresh `npm ci` at all - a real gap in what "matches CI" actually meant, corrected below.
+
+Fixed by regenerating the lockfile for real (`npm install` in a clean environment, matching `VERSION_MATRIX.md`'s own documented lockfile-regeneration policy), then re-verifying `npm ci` succeeds cleanly against the regenerated file:
+
+```text
+$ docker run --rm -v ".../frontend:/workspace" -w /workspace node:22.16.0 sh -c "npm ci"
+added 942 packages, and audited 944 packages in 2m
+(exit 0, no lockfile errors)
+```
+
+`git diff --stat frontend/package-lock.json`: 393 insertions, 171 deletions - a real, substantial drift, not a one-line fix.
+
+**A second, independent real bug found while investigating the first**: the failed run's job table above shows `e2e: success` even though `containers` was `skipped` (because `frontend` had genuinely failed) - `e2e` should never have run at all. Root cause: `e2e`'s `if:` condition only excluded `needs.containers.result == 'failure'/'cancelled'`, which does not cover `'skipped'` - and `containers` gets legitimately skipped for *two* different reasons (nothing relevant changed, or an upstream job genuinely failed), which that condition treated identically. Fixed by simplifying to `if: needs.containers.result == 'success'` and dropping the redundant `always()`/filter-recheck entirely - `containers`' own result already fully encodes both "did anything change" and "did backend/frontend actually pass," so `e2e` can just trust it via GitHub's normal skip propagation instead of re-deriving the same answer. The fact that `e2e` happened to still *pass* on this run doesn't make the condition correct - it ran against a stack that never had a validated, freshly-built image behind it at all, purely by coincidence of `compose.test.yaml` rebuilding from source independently (see Step 5's own documented `needs: containers` reasoning).
+
+**A real, self-inflicted incident during the investigation, disclosed rather than hidden**: reproducing the `npm ci` failure locally, my first attempt ran `docker compose run --rm frontend sh -c "rm -rf node_modules && npm ci"` - this uses the *actual* named volume (`starter-frontend-modules`) shared with the live, running dev-stack `frontend` container, not an isolated sandbox. `rm -rf` on the mounted directory failed to remove the mount point itself ("Device or resource busy") but had already recursively deleted every file *inside* it first - silently emptying the real dev container's `node_modules` and crash-looping it (`sh: nuxt: not found`, `Restarting (127)`). Caught immediately via `docker compose ps`, root-caused via `docker volume inspect`/a throwaway container reading the volume directly (confirmed genuinely empty, 0 entries), and recovered by reinstalling through the correct `docker compose run --rm frontend npm ci` path (which repopulates that exact volume) followed by `docker compose up -d frontend` - confirmed healthy again, then re-ran lint/typecheck/test locally to confirm nothing else was affected (all real, all passing - see updated Step 9 evidence). Named here because every other real mistake in this whole log gets root-caused and disclosed, and a mistake made *while investigating a bug* doesn't get an exception from that.
+
+**What this step still owes**: a fresh PR carrying this fix, and real confirmation that the corrected run passes - not yet gathered as of this entry (see Remaining uncertainty). The original planned drill (deliberately break one backend assertion, observe failure, revert, observe pass) was **not** performed - overtaken by a real failure that already demonstrated the same property (a genuine problem produced a genuine required-check failure) more convincingly than a manufactured one would have, but the "revert and confirm green again" half of the demonstration is still real, outstanding work for the follow-up PR this fix needs.
+
+**Step 7 - security review, from actually reading the current file**
+
+```text
+$ grep -n "permissions:" -A3 .github/workflows/ci.yml
+13:permissions:
+14-  contents: read
+$ grep -n "pull_request_target" .github/workflows/ci.yml
+none found
+$ grep -n "secrets\." .github/workflows/ci.yml
+none found
+$ grep -n "id-token\|deploy\|gcloud\|GCP" .github/workflows/ci.yml
+none found
+$ grep -oE "uses: [a-zA-Z0-9./_-]+@[a-zA-Z0-9.]+" .github/workflows/ci.yml | sort -u
+actions/checkout@v7
+actions/setup-node@v6
+actions/setup-python@v7
+actions/upload-artifact@v7
+docker/setup-buildx-action@v4
+dorny/paths-filter@v3
+```
+
+Confirmed, not assumed: exactly one `permissions:` block, top-level, `contents: read` only - no job overrides it, nothing broader appears anywhere. No `pull_request_target` anywhere in the file. Zero `secrets.` references - this workflow uses no secrets at all, by design. No `id-token`/deployment/`gcloud`/GCP reference anywhere - deployment concerns stay entirely out of this file, correctly deferred to Module 17's separate `deploy-gcp.yml`. Every third-party action is pinned to a major-version tag, matching `VERSION_MATRIX.md` exactly (added `dorny/paths-filter@v3` to that table this module, rather than leaving a newly-introduced action undocumented).
+
+*Major-version vs. commit-SHA pinning, for this project's actual risk level*: `VERSION_MATRIX.md` already flags checkout as worth considering for SHA-pinning "by policy" but leaves the rest at major-version tags. For a learner-workshop repo with no secrets in this workflow, no write permissions beyond reading its own contents, and no deploy-critical steps, the realistic threat this would defend against - a compromised or malicious update pushed to a major version tag by the action's own maintainer/account - is a real but low-probability, low-blast-radius risk here specifically *because* this workflow can't do anything more dangerous than read the checked-out code and run local commands against ephemeral, secret-free containers. The calculus changes completely for `deploy-gcp.yml` (real OIDC credentials, real production access) - worth SHA-pinning there far more than here, and out of this module's scope to touch.
+
+*Why fork PR secrets are a real risk this workflow correctly avoids*: a `pull_request` (not `pull_request_target`) trigger from a fork PR runs with a read-only `GITHUB_TOKEN` and, critically, **no access to repository secrets at all** by GitHub's own design - exactly the protection that exists specifically because a fork's workflow-file changes are attacker-controlled input. `pull_request_target` deliberately breaks that isolation (it runs using the *base* repo's context/secrets even for a fork PR, specifically so maintainers can do things like label PRs), which is exactly why it's dangerous to combine with checking out and running a fork's own code - and exactly why this file doesn't use it. Since this workflow uses zero secrets in the first place, the fork-PR-secrets risk class doesn't even apply here regardless of trigger choice - confirmed, not just assumed, by the `secrets.` grep above.
+
+*Why deploy-critical steps should never run on every PR*: a PR (especially from an external contributor, but even a learner's own draft branch) is inherently unreviewed, in-progress code - running a real deployment, a real database migration against production, or anything with real-world side effects on every PR push would mean any pushed commit, reviewed or not, gets a chance to affect production. `ci.yml` correctly never does this (confirmed above - no deploy/gcloud/id-token content at all); `deploy-gcp.yml` correctly gates on `push: tags: [v*]` and `workflow_dispatch`, not `pull_request`, keeping the trigger surface for anything deploy-critical entirely separate from "someone pushed to a branch."
+
+**Step 8 - named steps and step summaries**
+
+Every job added or touched this module (`changes`, `containers`, `e2e`) already uses separate named steps rather than one multi-line script - confirmed by rereading the final file, not assumed carried over from the backend/frontend work. Added a real `$GITHUB_STEP_SUMMARY` write to `backend`, `frontend`, and `e2e` (three jobs, not just the one the module asked for at minimum) - each under `if: always()` so the summary appears whether the job passed or failed, giving at-a-glance failure ownership (which job, which real check) without needing to open individual step logs first.
+
+**Step 9 - `make verify`, and real evidence it matches CI**
+
+`grep -n "^verify:" Makefile` before this module: no match - confirmed absent, not assumed. Added a `verify` target running the same real checks as the `backend`/`frontend` CI jobs, in the same order, against the already-running dev stack (`docker compose run --rm backend/frontend ...`, matching the established `make backend-quality`/`frontend-test` pattern rather than inventing a new one). Ran every one of its commands for real (`make` itself still isn't installed on this Windows workstation - the same documented gap since Module 01 - so the underlying `docker compose run` commands were run directly, exactly matching what the target itself executes):
+
+```text
+$ docker compose run --rm backend alembic upgrade head        → real migration, no-op (already at head)
+$ docker compose run --rm backend ruff check .                → All checks passed!
+$ docker compose run --rm backend ruff format --check .       → 44 files already formatted
+$ docker compose run --rm backend python -m mypy app          → Success: no issues found in 34 source files
+$ docker compose run --rm backend pytest                       → 55 passed, 1 warning in 35.14s
+$ docker compose run --rm frontend npm run lint                → (clean, exit 0)
+$ docker compose run --rm frontend npm run typecheck           → exit 0 (same benign pre-existing Volar warning documented since Module 11)
+$ docker compose run --rm frontend npm test                    → Test Files 9 passed (9); Tests 55 passed (55)
+$ docker compose run --rm frontend npm run build                → ✨ Build complete!
+```
+
+Real, honest, unavoidable difference documented in the target's own comment rather than left implicit: `make verify` does **not** include the `e2e` job (that's `make e2e-test`, deliberately separate - the acceptance stack is a materially heavier, slower gate than a pre-push sanity check should be) and cannot reproduce the exact cross-host CORS/cookie conditions Module 15 found (those need the genuinely separate-hostname acceptance stack, not the dev stack's shared-`localhost` topology). What it *can* and does cover for real: real PostgreSQL migration validation - not a CI-only capability at all, since the dev stack's own `db` service has been real `postgres:17-alpine` since Module 06, so `make verify`'s `alembic upgrade head` step is exercising the exact same kind of real database CI's `backend` job does, just against the long-lived dev database instead of a disposable CI-only one.
+
+**Independent challenge - path-aware change detection**
+
+Added a `changes` job using `dorny/paths-filter@v3` (added to `VERSION_MATRIX.md` this module, not left unpinned/undocumented) with three filters: `backend` (`backend/**`), `frontend` (`frontend/**`), and `infra` (`.github/workflows/**`, `compose*.yaml`, `**/Dockerfile`, `**/.dockerignore`, `e2e/**`). `backend`/`frontend`/`containers`/`e2e` each gate on `needs.changes.outputs.<area> == 'true' || needs.changes.outputs.infra == 'true'` - a documentation-only change (matching none of these globs) skips all four; a change to `.github/workflows/ci.yml` itself, any `compose*.yaml`, or any `Dockerfile`/`.dockerignore` forces `infra` true and therefore forces *every* downstream job to run regardless of whether backend/frontend code also changed - exactly the module's explicit requirement that path-filtering can never bypass validation of the workflow/build-context files themselves.
+
+`containers` and `e2e` needed a slightly more careful `if:` than a bare filter check, since GitHub Actions' default `needs:` behavior is to skip a downstream job automatically whenever *any* of its listed needs was itself skipped (not just failed) - which would have silently skipped `containers` any time `backend` or `frontend` skipped, even on an `infra`-only change where `containers` genuinely should still run. Fixed with an explicit `always() && needs.X.result != 'failure' && needs.X.result != 'cancelled' && (<the real filter condition>)` - `always()` overrides the automatic same-as-needs-skip propagation, and the explicit `result != 'failure'/'cancelled'` checks restore the actual safety property (never build/test against code whose own checks genuinely failed) that the default propagation would otherwise have provided for free.
+
+**How required-check names stay stable when jobs are conditionally skipped** (stated precisely, not guessed at, since the module asked for this explicitly): a job with a job-level `if:` that evaluates false is not *removed* from the workflow run - it still appears in the run's job list and in any branch-protection required-check list under its own stable name, just with a conclusion of `skipped` instead of `success`/`failure`. GitHub's branch protection treats a **required check that concludes `skipped`** as satisfying the requirement (not blocking merge) - this is the specific, deliberate behavior that makes path-filtering and required checks compatible with each other at all: if a skipped required check instead blocked merges the way a failed one does, a docs-only PR could never merge without someone re-running or bypassing the "unrelated" jobs. This only holds because the job names in this file never change based on *what* triggered the run (no matrix expansion, no dynamic job naming) - a required-check rule configured against `backend`/`frontend`/`containers`/`e2e`/`changes` by name will keep matching every run, whether those jobs actually executed or were correctly skipped.
+
+**Real bugs and gaps found - full list, root cause, and fix/disposition**
+
+1. The task's own premise (`npm ci`/caching "already updated") didn't match the real file - confirmed via `grep` before trusting it, fixed as real work rather than silently assumed done.
+2. No `make verify` target existed despite `make e2e-test`/`make backend-quality` already establishing the pattern. Added, and every one of its real commands run and confirmed passing against the dev stack.
+3. `dorny/paths-filter` was a new, previously-undocumented action for this repo - added to `VERSION_MATRIX.md` in the same module that introduced it, rather than leaving version-pinning discipline to lapse for a third-party action specifically (the one category `VERSION_MATRIX.md` itself flags as needing more scrutiny than an official `actions/`/`docker/` action).
+4. Default `needs:`-skip propagation would have silently skipped `containers`/`e2e` on an infra-only change with no backend/frontend diff, which is exactly the case the independent challenge's own requirement ("still require the workflow file itself, compose files, and Dockerfiles to always be checked") explicitly rules out. Caught by tracing the actual GitHub Actions skip-propagation semantics before trusting a bare filter-output `if:`, not discovered by a failed run - fixed with the explicit `always()`-plus-result-check pattern above.
+5. **Major, real, found via the actual live run**: `frontend/package-lock.json` was genuinely out of sync with `frontend/package.json` (missing `oxc-parser` and 18 platform bindings) - invisible under `npm install`'s tolerant re-resolution, caught immediately by `npm ci`'s strict check in real CI. Root-caused by reproducing locally, fixed by regenerating the lockfile for real (393 insertions/171 deletions - substantial drift, not cosmetic).
+6. **Real logic bug in my own workflow, found while investigating #5**: `e2e`'s `if:` condition excluded `containers.result == 'failure'/'cancelled'` but not `'skipped'`, so `e2e` ran (and happened to pass) even on the run where `frontend` genuinely failed and `containers` was correctly skipped as a result. Fixed by simplifying to `needs.containers.result == 'success'`.
+7. **Real, self-inflicted incident during investigation, disclosed not hidden**: reproducing the `npm ci` failure via `docker compose run --rm frontend sh -c "rm -rf node_modules && npm ci"` used the real named volume shared with the live dev-stack `frontend` container, silently emptying its `node_modules` and crash-looping it. Caught via `docker compose ps`, root-caused via `docker volume inspect`, recovered by reinstalling through the same shared-volume path and confirming the container returned to healthy plus a full local lint/typecheck/test re-run.
+8. Step 6's original plan (a deliberate, manufactured backend-test failure) never happened - overtaken by a real one. The "revert and confirm green" half of the demonstration is still genuinely outstanding, tracked in Remaining uncertainty, not silently marked done.
+
+**Decision and tradeoff**
+
+Chose `needs: containers` (a sequencing gate) over a fully independent `e2e` build for the acceptance stack, rather than trying to actually pass the `containers` job's built image layers into `e2e`. Alternative considered: push the `containers`-built images to a registry (even a throwaway one) so `e2e` could pull the exact tested artifact instead of rebuilding. Rejected for this module: registry push/pull is real infrastructure that belongs with Module 17's actual deployment credentials and Artifact Registry setup, not duplicated here for a same-workflow same-commit rebuild that Docker's own layer cache already makes cheap in practice. Documented the real limitation (no cross-job image identity guarantee) rather than silently implying `e2e` tests the literal same image bytes `containers` built.
+
+**Security, privacy, and operations**
+
+This module's entire real content *is* a security/operations review, more than any prior module's incidental findings: confirmed (not assumed) that `ci.yml` carries the single narrowest permission it needs (`contents: read`), touches no secrets, never uses the one trigger (`pull_request_target`) that would make that safe posture dangerous, and keeps every deploy-capable action entirely out of the file. The new `containers` job step actively checks (not just documents) that `.env`/`.git` can't leak into a production image's build context. The new `e2e` job's artifact retention was deliberately shortened to 5 days specifically because Playwright traces can capture real page content, not left at GitHub's 90-day default. No real credentials appear anywhere in this module's own evidence - the CI Postgres password (`ci-only-not-a-real-secret`) is an intentionally-named non-secret, ephemeral per-run value.
+
+**Review feedback**
+
+The original PR (#15) was merged with a genuinely failing required check (`frontend`, real `npm ci` failure) still showing on the run - real, worth naming plainly rather than glossing over: this means either branch protection isn't currently configured to require these checks on this repository, or the merge went through some other path. Directly relevant to this module's own subject matter (required-check enforcement), not a side note - flagged explicitly in Remaining uncertainty below rather than assumed to be working correctly just because the workflow file itself is correct.
+
+**Remaining uncertainty**
+
+- This fix (lockfile regeneration + the `e2e` conditional fix) still needs a fresh PR and a real, confirmed-green run - genuinely not yet gathered as of this entry, not glossed over.
+- Whether branch protection on this repository is actually configured to *require* these checks before allowing a merge was never verified, and the original PR merging despite a real `frontend` failure is real evidence pointing at "probably not, or not effectively" - worth the user confirming/configuring directly in the repository's GitHub UI, since that's a repository setting outside what `gh`-less, unauthenticated tooling can check or change.
+- Whether `e2e`'s `needs: containers` sequencing choice should eventually become a real registry-backed image-identity guarantee once Module 17 adds Artifact Registry - flagged as a natural follow-on, not decided here.
+
+**Self-rating**
+
+- I can repeat this with notes: yes - job DAG design (independent vs. dependent jobs), GitHub Actions service containers, path-aware conditional skipping and its interaction with the default needs-skip propagation, and the security review methodology (permissions, trigger risk, secrets boundaries, action pinning).
+- I can explain it without the reference code: yes - a skipped required check still reports a completed, non-failing check result to branch protection; it remains present under its stable job name and does not behave like a failed or missing required check, which is exactly what makes path-filtering and required checks compatible with each other. pull_request_target runs using the base repository's security context (including its secrets and elevated token) even for a fork PR; if that workflow then checks out and executes the fork's own code, attacker-controlled code gets to run with access it should never have - the danger is specifically in combining the elevated context with untrusted code execution, not either property alone. The CI Postgres password is intentionally disposable test configuration with no real-world value or privilege - it only ever protects an ephemeral, secret-free database that exists for the length of one job run; a real credential must be stored as a secret because its exposure would grant access to something that actually matters.
+- I can diagnose one failure in this area: yes - would define independent jobs and their real dependencies, use realistic backing services rather than shortcuts, keep required check names stable under path filtering, and review exactly what code and credentials each trigger type can expose before trusting any workflow's safety.
+- Confidence from 1-5: 5/5 for the reasoning, design, and implementation - the still-missing live PR run (Step 6) doesn't change confidence in any of that; it's a separate, explicitly unverified integration confirmation, not evidence against what's already been reasoned through and built.
+
+---
+
 ## Module entry template
 
 ### Module NN — title
