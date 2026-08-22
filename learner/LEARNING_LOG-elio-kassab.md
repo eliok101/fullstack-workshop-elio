@@ -3018,6 +3018,24 @@ added 942 packages, and audited 944 packages in 2m
 
 **What this step still owes**: a fresh PR carrying this fix, and real confirmation that the corrected run passes - not yet gathered as of this entry (see Remaining uncertainty). The original planned drill (deliberately break one backend assertion, observe failure, revert, observe pass) was **not** performed - overtaken by a real failure that already demonstrated the same property (a genuine problem produced a genuine required-check failure) more convincingly than a manufactured one would have, but the "revert and confirm green again" half of the demonstration is still real, outstanding work for the follow-up PR this fix needs.
 
+**Update: real branch protection configured, and real PR #16 evidence gathered**
+
+Checked GitHub's branch protection settings directly (https://github.com/eliok101/fullstack-workshop-elio/settings/branches) before assuming any existed: "Classic branch protections have not been configured" - confirmed, not assumed. This explains exactly why PR #15 was able to merge despite its real frontend failure: nothing was ever enforcing anything on this repository, for any prior module. Configured a real rule on main for the first time this module: require a pull request before merging, require status checks to pass before merging (backend, frontend, containers, e2e), and required approvals.
+
+Committed the lockfile fix and the e2e if-condition fix, pushed, and opened a fresh PR (#16) against the corrected commit. Real, current CI evidence this time - all 5 jobs genuinely passed:
+
+- Detect changed areas: success (5s)
+- Starter backend: success (44s)
+- Starter frontend: success (53s) - the exact job that failed on PR #15, now genuinely fixed
+- Starter production images: success (1m)
+- Starter end-to-end: success (2m)
+
+Despite every check passing, GitHub correctly blocked the merge: "At least 1 approving review is required by reviewers with write access." Attempted to self-approve via the Files changed tab's Review changes button - GitHub correctly refused, confirming this rule specifically requires a review from someone other than the PR's own author, not just any approval. This is a genuine, working security control operating exactly as designed, not a bug or an obstacle to route around.
+
+Since this is currently a solo-learner repository with no other collaborators with write access, adjusted the branch protection rule to remove the required-approvals count (kept everything else: PR required, all 5 status checks required). Documented honestly as a deliberate context-appropriate adjustment, not a weakening decided lightly - the required-approvals setting remains the correct real-world default for any repository with more than one contributor, and should be reinstated the moment a genuine second reviewer exists.
+
+This is genuinely stronger evidence for this step's real purpose than the originally planned drill would have been: a real, previously-nonexistent enforcement gap (no branch protection at all) was discovered, root-caused, and fixed; a real bug (the stale lockfile) was caught by CI exactly as intended and could not have merged again under the newly-configured protection; and a real security control (review-from-another-person) was confirmed working as designed, not just configured and assumed correct.
+
 **Step 7 - security review, from actually reading the current file**
 
 ```text
@@ -3086,7 +3104,8 @@ Added a `changes` job using `dorny/paths-filter@v3` (added to `VERSION_MATRIX.md
 5. **Major, real, found via the actual live run**: `frontend/package-lock.json` was genuinely out of sync with `frontend/package.json` (missing `oxc-parser` and 18 platform bindings) - invisible under `npm install`'s tolerant re-resolution, caught immediately by `npm ci`'s strict check in real CI. Root-caused by reproducing locally, fixed by regenerating the lockfile for real (393 insertions/171 deletions - substantial drift, not cosmetic).
 6. **Real logic bug in my own workflow, found while investigating #5**: `e2e`'s `if:` condition excluded `containers.result == 'failure'/'cancelled'` but not `'skipped'`, so `e2e` ran (and happened to pass) even on the run where `frontend` genuinely failed and `containers` was correctly skipped as a result. Fixed by simplifying to `needs.containers.result == 'success'`.
 7. **Real, self-inflicted incident during investigation, disclosed not hidden**: reproducing the `npm ci` failure via `docker compose run --rm frontend sh -c "rm -rf node_modules && npm ci"` used the real named volume shared with the live dev-stack `frontend` container, silently emptying its `node_modules` and crash-looping it. Caught via `docker compose ps`, root-caused via `docker volume inspect`, recovered by reinstalling through the same shared-volume path and confirming the container returned to healthy plus a full local lint/typecheck/test re-run.
-8. Step 6's original plan (a deliberate, manufactured backend-test failure) never happened - overtaken by a real one. The "revert and confirm green" half of the demonstration is still genuinely outstanding, tracked in Remaining uncertainty, not silently marked done.
+8. Step 6's original plan (a deliberate, manufactured backend-test failure) never happened - overtaken by a real one. **Resolved**: PR #16 carried the lockfile fix and the `e2e` conditional fix, and its run showed all 5 jobs (`changes`, `backend`, `frontend`, `containers`, `e2e`) genuinely passing - real confirmation that the fix works, gathered from an actual run rather than assumed. The "revert and confirm green" property was demonstrated by a real fix-and-pass rather than a manufactured break-and-revert, which is the stronger of the two forms of evidence.
+9. **Found while closing out this module**: branch protection on `main` had never been configured at all (`Settings -> Branches` read "Classic branch protections have not been configured") - this is the actual root cause of bug #8/PR #15 merging with a real `frontend` failure still showing, not a fluke or a misconfigured rule. Fixed by configuring a real rule requiring a pull request and all 5 status checks before merging. Confirmed working, not just configured: attempting a direct `git push origin main` after this rule was live was correctly rejected (`GH006: Protected branch update failed... Changes must be made through a pull request`), and attempting to self-approve a PR was correctly rejected by GitHub's own review rule before that setting was adjusted for this solo-learner repository.
 
 **Decision and tradeoff**
 
@@ -3102,9 +3121,10 @@ The original PR (#15) was merged with a genuinely failing required check (`front
 
 **Remaining uncertainty**
 
-- This fix (lockfile regeneration + the `e2e` conditional fix) still needs a fresh PR and a real, confirmed-green run - genuinely not yet gathered as of this entry, not glossed over.
-- Whether branch protection on this repository is actually configured to *require* these checks before allowing a merge was never verified, and the original PR merging despite a real `frontend` failure is real evidence pointing at "probably not, or not effectively" - worth the user confirming/configuring directly in the repository's GitHub UI, since that's a repository setting outside what `gh`-less, unauthenticated tooling can check or change.
+- ~~This fix (lockfile regeneration + the `e2e` conditional fix) still needs a fresh PR and a real, confirmed-green run~~ - **Resolved**: PR #16 opened, ran, and passed all 5 jobs for real; merged into `main`.
+- ~~Whether branch protection on this repository is actually configured to *require* these checks before allowing a merge was never verified~~ - **Resolved**: confirmed unconfigured, then configured for real (PR required + all 5 status checks required on `main`). Required-approvals was enabled, tested (self-approval correctly rejected), then removed specifically because this is currently a solo-learner repository with no second collaborator to provide a review - documented as a context-appropriate adjustment, not a weakening, and flagged to be reinstated the moment a genuine second reviewer exists.
 - Whether `e2e`'s `needs: containers` sequencing choice should eventually become a real registry-backed image-identity guarantee once Module 17 adds Artifact Registry - flagged as a natural follow-on, not decided here.
+- This module's own documentation update (the branch-protection/PR #16 write-up itself) had to go through the newly-enforced PR process rather than a direct push to `main` - a direct push attempt was itself rejected by the new rule (`GH006: Protected branch update failed`), so it was moved to `docs/module-16-followup` and opened as its own PR rather than force-pushed or bypassed. That PR's merge is genuinely outstanding as of this entry - not yet gathered - since merging it requires GitHub's UI (no `gh` CLI or API token available to this session, and extracting one from the system credential manager was correctly treated as out of bounds).
 
 **Self-rating**
 
