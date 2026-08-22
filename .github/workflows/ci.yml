@@ -157,11 +157,22 @@ jobs:
 
   e2e:
     name: Starter end-to-end
-    needs: [changes, containers]
-    if: >-
-      always() &&
-      needs.containers.result != 'failure' && needs.containers.result != 'cancelled' &&
-      (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true')
+    needs: containers
+    # Deliberately just needs.containers.result == 'success' - no always()
+    # override, no re-checking `changes` outputs directly. containers already
+    # encodes "did anything relevant change" (it skips when nothing did) and
+    # "did backend/frontend actually pass" (it skips on their real failure)
+    # in its own single result value, so e2e can just trust that outcome via
+    # GitHub's normal needs-skip propagation. A real, found-via-a-real-run
+    # bug lived here before this fix: the previous condition only excluded
+    # needs.containers.result == 'failure'/'cancelled', which let e2e run
+    # even when containers was 'skipped' - including the case where it was
+    # skipped *because frontend genuinely failed*, not because nothing
+    # relevant changed. Confirmed live in run 32376116248 (PR #15): frontend
+    # failed on a real npm-ci/lockfile mismatch, containers correctly
+    # skipped, but e2e still ran anyway (and passed, since it doesn't depend
+    # on containers' build output at all - see the job's own comment below).
+    if: needs.containers.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
