@@ -8,10 +8,10 @@ resource "google_sql_database_instance" "postgres" {
   name                = var.cloud_sql_instance_name
   database_version    = "POSTGRES_17"
   region              = var.region
-  edition             = "ENTERPRISE"
   deletion_protection = var.deletion_protection
 
   settings {
+    edition           = "ENTERPRISE"
     tier              = var.database_tier
     availability_type = "ZONAL"
     disk_type         = "PD_SSD"
