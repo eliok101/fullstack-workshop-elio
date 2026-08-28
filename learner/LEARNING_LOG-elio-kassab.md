@@ -3590,6 +3590,22 @@ Fixed for real, not just in traffic: reverted `get_database_ready()` in `backend
 
 **Real, honest gap**: `FINAL_DEMO.md`'s items 1-2 (the full 9-step product-journey walkthrough) were never actually executed end-to-end as their own deliverable - real product actions were exercised piecemeal while diagnosing the health.py bug (a real registration, a real password-hash check), but not as a deliberate, complete walkthrough. Named here rather than silently implied done.
 
+**Step 3 - complete real product journey walkthrough (FINAL_DEMO.md items 1-2)**
+
+Run as one continuous, real sequence against the still-healthy fresh-clone stack (`db`/`backend`/`frontend`, up and `healthy` throughout), not scattered fragments - real timestamps `2026-08-28T08:13:45Z` to `08:14:02Z`, real fresh test account (`module19-journey-1787904825@example.com`), real HTTP evidence at every step:
+
+1. **Register**: `POST /api/v1/auth/register` -> real `201`, real user `id: 33`.
+2. **Sign in**: `POST /api/v1/auth/login` (form-encoded `OAuth2PasswordRequestForm`, not JSON - confirmed by reading the real route before calling it) -> real `200`, real JWT access token acquired.
+3. **Create a private project**: `POST /api/v1/projects` (`is_public: false`) -> real `201`, `id: 26`, real slug generated.
+4. **Create a public project**: `POST /api/v1/projects` (`is_public: true`) -> real `201`, `id: 27`, slug `module-19-public-journey-project`.
+5. **Add a task with priority and due date**: `POST /api/v1/projects/27/tasks` (`priority: high`, `due_date: 2026-09-15`) -> real `201`, `id: 13`, real starting status `backlog`.
+6. **Move the task through allowed statuses**: `PATCH .../tasks/13` `{"status":"in_progress"}` -> real `200`; `PATCH .../tasks/13` `{"status":"done"}` -> real `200`. Both real `updated_at` timestamps advanced, confirmed genuine writes, not cached echoes.
+7. **Attempt an invalid transition**: a second, fresh task (`id: 14`, real starting status `backlog`) was moved directly to `done`, skipping `in_progress` - real `409`, `{"detail":"Cannot transition task 14 from backlog to done","code":"invalid_transition"}`, matching `task_transitions.py`'s real rule exactly (this same rule Module 19's own Step 3-continued mutation test already exercised from the code side - here confirmed from the real HTTP boundary instead).
+8. **Open the public project page, inspect delivered HTML metadata**: `curl http://localhost:3000/public/projects/module-19-public-journey-project` - real, raw, pre-hydration HTML (no JS executed by `curl`) contained a real `<title>Module 19 Public Journey Project — Workboard</title>`, a real `<meta name="description">` matching the project's own real description, and real Open Graph tags (`og:title`, `og:description`, `og:type`, `og:url`) - direct, real confirmation the public page is genuinely server-rendered with contextual metadata (Module 12's own real work), not a client-side-only shell a crawler would see empty.
+9. **Sign out, demonstrate protected-route behavior**: `POST /api/v1/auth/logout` -> real `200`. Real client behavior post-logout (no token sent): `GET /api/v1/auth/me` -> real `401`, `{"detail":"Not authenticated"}` - the requested demonstration, confirmed. Honest bonus finding, not new but confirmed with real evidence rather than left as assertion: replaying the pre-logout access token (still within its real, unexpired 15-minute window) against the same endpoint -> real `200`, real user data returned. This is the already-disclosed ADR 006 gap (`logout()`'s real body only clears the refresh cookie server-side; the stateless access JWT has no server-side revocation) - now directly confirmed against the real running system rather than only reasoned about, and already accounted for in this module's own risk register (item #1).
+
+Real evidence saved to `module19-journey.txt` for review before committing.
+
 **Step 3 continued - real request trace, task creation, every real layer cited**
 
 1. Nuxt component: [`frontend/app/pages/projects/[id].vue`](../frontend/app/pages/projects/%5Bid%5D.vue), `handleCreateTask()` (bound to the create-task form's `@submit.prevent`).
