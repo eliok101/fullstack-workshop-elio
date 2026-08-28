@@ -2,15 +2,19 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.db.session import database_is_ready
+
 router = APIRouter(tags=["health"])
 
 
 def get_database_ready() -> bool:
-    # MODULE 18 DELIBERATE DRILL — always-fail readiness. Revert after the drill.
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="database unavailable",
-    )
+    try:
+        return database_is_ready()
+    except Exception as exc:  # database details belong in logs, not the response
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database unavailable",
+        ) from exc
 
 
 def _check_readiness(is_ready: bool) -> dict[str, str]:
