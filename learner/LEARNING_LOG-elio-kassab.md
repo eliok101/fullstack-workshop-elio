@@ -3691,6 +3691,13 @@ Pulled from the register's top-ranked, real-user-blocking items, choosing the 3 
 
 While confirming commit metadata for real (not assumed), discovered the local git config's user.email was set to "eliokssab289@gmail.com" (missing the "a" in "kassab") - a standing typo, not specific to this session, affecting every commit made from this machine across the whole course. Fixed going forward only (`git config --global user.email`), leaving prior history unmodified rather than rewriting commit hashes for a cosmetic metadata correction - a deliberate, low-risk-tolerance choice given how much of this course's real evidence (PR links, commit references) already points at the existing hashes.
 
+**Self-rating**
+
+- I can repeat this with notes: yes - would use a checklist for the exact clean-checkout steps, mutation/recovery commands, and handover-evidence inventory, but could repeat the full capstone workflow.
+- I can explain it without the reference code: yes - a clean checkout removes invisible local state (uncommitted files, cached dependencies, generated artifacts, remembered environment configuration, undocumented manual fixes); if a project cannot be rehearsed from a genuinely fresh clone, the documentation is incomplete regardless of how well it works in a familiar working directory - proven directly this module when the clean-checkout rehearsal caught a real production bug the working directory never would have revealed. A risk register needs an owner, next evidence, and urgency so each item is actionable and auditable, not just a list of concerns with no decision path - a generic wishlist can't be prioritized or tracked to resolution. Conceding a valid counterpoint during an architecture defense strengthens the position rather than weakening it because it distinguishes the actual, contextual decision boundary from an overstated marketing claim - it shows the choice was made for real, specific reasons that hold up under challenge, rather than a claim that the alternative is categorically worse.
+- I can diagnose one failure in this area: yes, with an initial discovery phase - on an unfamiliar codebase, would first establish its architecture, deployment topology, test posture, state/secret ownership, and operational evidence before assessing readiness, rather than assuming existing documentation or local state reflects production truth.
+- Confidence from 1-5: 4/5 - confident in the method and the judgment it requires; the remaining margin is for applying this same capstone review to a genuinely unfamiliar system, with different tooling, team conventions, and production constraints than the one built and operated throughout this workshop.
+
 ## Module entry template
 
 ### Module NN — title
