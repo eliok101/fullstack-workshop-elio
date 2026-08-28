@@ -3675,6 +3675,10 @@ Pulled from the register's top-ranked, real-user-blocking items, choosing the 3 
 - Rollout/rollback: a workflow-file-only change - rollback is a plain git revert of that one file, no application or data impact either direction.
 - Why it outranks #3/#4: it is the cheapest of everything in the entire register (hours, not days) and directly closes the exact mechanism that already caused one real, documented incident this course - the strongest "prevent this specific known failure from recurring" case available, and folding it in alongside #1/#2 costs almost nothing of the 30-day budget.
 
+**Real, minor finding during this module: a typo'd git author email**
+
+While confirming commit metadata for real (not assumed), discovered the local git config's user.email was set to "eliokssab289@gmail.com" (missing the "a" in "kassab") - a standing typo, not specific to this session, affecting every commit made from this machine across the whole course. Fixed going forward only (`git config --global user.email`), leaving prior history unmodified rather than rewriting commit hashes for a cosmetic metadata correction - a deliberate, low-risk-tolerance choice given how much of this course's real evidence (PR links, commit references) already points at the existing hashes.
+
 ## Module entry template
 
 ### Module NN — title
