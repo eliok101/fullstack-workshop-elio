@@ -9,7 +9,7 @@ DEMO_SECRET_KEY = "insecure-development-only-key-change-me"
 
 class Settings(BaseSettings):
     app_name: str = "Workboard API"
-    app_version: str = "0.1.0"
+    app_version: str = "0.1.1"
     environment: Literal["development", "test", "production"] = "development"
     api_prefix: str = "/api/v1"
 
