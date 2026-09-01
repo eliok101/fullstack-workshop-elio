@@ -41,7 +41,22 @@ jobs:
   backend:
     name: Starter backend
     needs: changes
-    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.infra == 'true'
+    # github.event_name == 'workflow_call' is deliberately first: real bug,
+    # found live (Cloud Run deploy for tag v1.0.2-cors-incident, run
+    # 33520744857) - dorny/paths-filter has no defined base for the
+    # workflow_call event (only pull_request/push are handled), so when
+    # deploy-gcp.yml's `verify` job calls this workflow to gate a real
+    # deploy, `changes` silently diffs the checkout against itself, every
+    # output comes back 'false', and this job (and frontend/containers/e2e
+    # below) skipped - every tag-triggered deploy since Module 19's "verify
+    # must run before deploy" fix had actually been shipping with zero real
+    # checks executed, `verify` reporting success purely from the skip
+    # cascade. Unconditionally true for workflow_call sidesteps the broken
+    # diff entirely: a deploy gate should never skip a real check because a
+    # path filter couldn't compute a meaningful answer, whereas the
+    # existing changes.outputs.* fast path stays exactly as-is for its two
+    # working triggers (pull_request, push to main).
+    if: github.event_name == 'workflow_call' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -97,7 +112,10 @@ jobs:
   frontend:
     name: Starter frontend
     needs: changes
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true'
+    # See the backend job's comment above: workflow_call (deploy-gcp.yml's
+    # verify gate) always runs this in full - paths-filter can't compute a
+    # real diff for that event.
+    if: github.event_name == 'workflow_call' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -132,11 +150,13 @@ jobs:
   containers:
     name: Starter production images
     needs: [changes, backend, frontend]
+    # Same workflow_call carve-out as backend/frontend above, folded into
+    # this job's existing "did anything relevant change" clause.
     if: >-
       always() &&
       needs.backend.result != 'failure' && needs.backend.result != 'cancelled' &&
       needs.frontend.result != 'failure' && needs.frontend.result != 'cancelled' &&
-      (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true')
+      (github.event_name == 'workflow_call' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.infra == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
