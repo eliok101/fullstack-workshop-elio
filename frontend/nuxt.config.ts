@@ -62,9 +62,25 @@ export default defineNuxtConfig({
     externals: { inline: ['vue', 'vue/server-renderer'] }
   },
   routeRules: {
-    // Step 4: the home page has no per-user data - safe to generate once at
-    // build time instead of on every request.
-    '/': { prerender: true },
+    // Real production bug, found live on the deployed Cloud Run frontend and
+    // confirmed by curling the live homepage: `prerender: true` bakes the
+    // page's runtime-config hydration payload once at `nuxt build` time -
+    // before NUXT_PUBLIC_API_BASE is known, since that's only set later, as
+    // a Cloud Run env var at deploy time (.github/workflows/deploy-gcp.yml).
+    // The live home page's HTML had apiBase frozen at its
+    // http://localhost:8000/api/v1 build-time default as a result. Every
+    // visitor lands on '/' first, and frontend/app/plugins/api.ts only calls
+    // useRuntimeConfig() once, at client boot - so every subsequent
+    // client-side action for the rest of that browser session (Sign up,
+    // Log in, the background auth/refresh check) silently reused that same
+    // wrong, unreachable-from-the-browser base URL. Real impact: account
+    // creation and session refresh were completely broken for every real
+    // visitor. swr re-renders from the live server - picking up its
+    // correctly-overridden runtime config - at most once a minute instead of
+    // freezing forever at build time, the same mechanism already proven
+    // below for public project pages, so the home page keeps almost all of
+    // prerender's speed without ever serving a build-time-stale apiBase.
+    '/': { swr: 60 },
     // Step 4: public project content changes independently of any deploy
     // (task counts move as tasks change), so it can't be prerendered like
     // home - but it also isn't volatile enough to need a fresh render on
