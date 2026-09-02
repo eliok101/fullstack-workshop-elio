@@ -2,6 +2,24 @@ export default defineNuxtConfig({
   compatibilityDate: '2026-07-01',
   devtools: { enabled: false },
   modules: ['@nuxt/eslint', '@pinia/nuxt'],
+  // Real bug, found live on the deployed site and confirmed on two separate
+  // swr routes ('/' and the long-standing '/public/projects/**'): with
+  // payload extraction on (Nuxt's default whenever any route is
+  // prerendered/cached), a cached route's hydration payload ships as a
+  // separate `_payload.json` fetch (confirmed directly: the response's
+  // `#__NUXT_DATA__` script tag carries a `data-src` pointing at that file
+  // instead of the JSON inline) rather than embedded in the initial HTML.
+  // The client mounts once that separate fetch resolves, and every real
+  // browser test against the live production build (never reproducible in
+  // dev, which doesn't extract payloads at all) showed a real "Hydration
+  // completed but contains mismatches" warning as a result. Functionally
+  // harmless here - Vue recovers and every real user flow tested clean
+  // regardless - but real and worth removing outright. Extraction exists so
+  // a prerendered page's client-side navigation can fetch just its data
+  // from static hosting with no live server behind it; this app is never
+  // statically hosted; it always runs behind a live Nitro server on Cloud
+  // Run, so the tradeoff extraction exists for buys nothing here.
+  experimental: { payloadExtraction: false },
   css: ['~/assets/css/main.css'],
   runtimeConfig: {
     // Server-only: used by Nuxt's own server-side rendering process to reach the
