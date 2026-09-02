@@ -8,6 +8,7 @@
 import type {
   Project,
   ProjectCreateRequest,
+  ProjectListResponse,
   Task,
   TaskCreateRequest,
   TaskUpdateRequest
@@ -17,7 +18,11 @@ export function useProjectsApi() {
   const { $api } = useNuxtApp()
 
   return {
-    listProjects: (signal?: AbortSignal) => $api.get<Project[]>('/projects', { signal }),
+    listProjects: (params?: { page?: number; pageSize?: number }, signal?: AbortSignal) =>
+      $api.get<ProjectListResponse>('/projects', {
+        query: { page: params?.page, page_size: params?.pageSize },
+        signal
+      }),
     getProject: (id: number, signal?: AbortSignal) => $api.get<Project>(`/projects/${id}`, { signal }),
     createProject: (payload: ProjectCreateRequest) => $api.post<Project>('/projects', { body: payload }),
 

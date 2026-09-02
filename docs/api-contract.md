@@ -92,7 +92,19 @@ Returns the authenticated user.
 
 ### `GET /api/v1/projects`
 
-Lists projects visible to the authenticated user through ownership or membership.
+Lists projects visible to the authenticated user through ownership or membership, ordered newest-first, paginated. Query params: `page` (default `1`, minimum `1`), `page_size` (default `20`, `1`-`100`).
+
+Response:
+
+```json
+{
+  "items": [{ "id": 1, "name": "Intern workboard", "slug": "intern-workboard", "description": "Capstone delivery plan", "is_public": true, "owner_id": 1, "created_at": "...", "updated_at": "..." }],
+  "total": 1,
+  "page": 1,
+  "page_size": 20,
+  "total_pages": 1
+}
+```
 
 ### `POST /api/v1/projects`
 

@@ -250,6 +250,94 @@ def test_non_owner_cannot_update_project(auth_ctx):
     assert get_response.json()["name"] == "Not Yours To Edit"
 
 
+def test_list_projects_returns_paginated_envelope(auth_ctx):
+    create_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Envelope Test Project", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    auth_ctx.created_project_ids.append(create_response.json()["id"])
+
+    response = client.get("/api/v1/projects", headers=auth_ctx.headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"items", "total", "page", "page_size", "total_pages"}
+    assert body["page"] == 1
+    assert body["page_size"] == 20
+    assert body["total"] >= 1
+    assert any(item["id"] == create_response.json()["id"] for item in body["items"])
+
+
+def test_list_projects_pagination_boundaries(auth_ctx):
+    ids = []
+    for i in range(3):
+        response = client.post(
+            "/api/v1/projects",
+            json={"name": f"Boundary Project {i}", "is_public": False},
+            headers=auth_ctx.headers,
+        )
+        ids.append(response.json()["id"])
+    auth_ctx.created_project_ids.extend(ids)
+
+    # This user's *only* 3 projects are the ones just created (fixture gives
+    # a fresh user per test), so page_size=2 makes the total/total_pages math
+    # exact rather than dependent on unrelated state.
+    page_one = client.get(
+        "/api/v1/projects?page=1&page_size=2", headers=auth_ctx.headers
+    )
+    assert page_one.status_code == 200
+    body_one = page_one.json()
+    assert body_one["total"] == 3
+    assert body_one["total_pages"] == 2
+    assert len(body_one["items"]) == 2
+
+    page_two = client.get(
+        "/api/v1/projects?page=2&page_size=2", headers=auth_ctx.headers
+    )
+    body_two = page_two.json()
+    assert len(body_two["items"]) == 1
+
+    # No overlap between pages, and together they account for every project.
+    ids_one = {item["id"] for item in body_one["items"]}
+    ids_two = {item["id"] for item in body_two["items"]}
+    assert ids_one.isdisjoint(ids_two)
+    assert ids_one | ids_two == set(ids)
+
+    # Past the last real page: still a valid, empty response, not a 404 or
+    # a wraparound - the same shape a UI's "Next" button would ever see.
+    page_three = client.get(
+        "/api/v1/projects?page=3&page_size=2", headers=auth_ctx.headers
+    )
+    assert page_three.status_code == 200
+    assert page_three.json()["items"] == []
+    assert page_three.json()["total_pages"] == 2
+
+
+def test_list_projects_pagination_still_respects_visibility(auth_ctx):
+    own_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Mine, Should Be Listed", "is_public": False},
+        headers=auth_ctx.headers,
+    )
+    auth_ctx.created_project_ids.append(own_response.json()["id"])
+
+    stranger = _register_second_user(auth_ctx)
+    stranger_response = client.post(
+        "/api/v1/projects",
+        json={"name": "Theirs, Should Not Be Listed", "is_public": False},
+        headers=stranger.headers,
+    )
+    auth_ctx.created_project_ids.append(stranger_response.json()["id"])
+
+    response = client.get(
+        "/api/v1/projects?page=1&page_size=100", headers=auth_ctx.headers
+    )
+    body = response.json()
+    listed_ids = {item["id"] for item in body["items"]}
+    assert own_response.json()["id"] in listed_ids
+    assert stranger_response.json()["id"] not in listed_ids
+
+
 def test_non_owner_cannot_delete_project(auth_ctx):
     create_response = client.post(
         "/api/v1/projects",

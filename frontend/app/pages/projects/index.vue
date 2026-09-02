@@ -4,11 +4,20 @@
 // same client-authenticated-baseline reason as /dashboard.
 const api = useProjectsApi()
 
-const { data: projects, pending, status, error, refresh } = await useAsyncData(
+// Real pagination state - see the removed demo note below. currentPage
+// drives the actual request; total-pages/total come back from the server
+// on every response instead of being assumed, so a project created or
+// deleted while paging is always reflected correctly.
+const currentPage = ref(1)
+
+const { data: response, pending, status, error, refresh } = await useAsyncData(
   'all-projects',
-  () => api.listProjects(),
-  { server: false }
+  () => api.listProjects({ page: currentPage.value }),
+  { server: false, watch: [currentPage] }
 )
+
+const projects = computed(() => response.value?.items ?? [])
+const totalPages = computed(() => response.value?.total_pages ?? 1)
 
 const name = ref('')
 const description = ref('')
@@ -29,19 +38,22 @@ async function handleCreate() {
     name.value = ''
     description.value = ''
     isPublic.value = false
-    await refresh()
+    // New projects sort first (created_at desc) - jump back to page 1 so
+    // the one just created is actually visible, rather than leaving the
+    // user on whatever later page they were paging through, wondering
+    // where it went. currentPage.value = 1 alone wouldn't refetch if
+    // they were already on page 1, so refresh() covers that case too.
+    if (currentPage.value === 1) {
+      await refresh()
+    } else {
+      currentPage.value = 1
+    }
   } catch (err) {
     createErrorMessage.value = err instanceof Error ? err.message : 'Could not create the project.'
   } finally {
     creating.value = false
   }
 }
-
-// Demo-only: the real list endpoint still has no page/limit params (see
-// docs/api-contract.md), so there is nothing real to paginate yet - this
-// only proves PaginationControls renders and its boundary logic works.
-const demoPage = ref(1)
-const demoTotalPages = 3
 
 // Step 3/Step 1 table: same reasoning as dashboard.vue.
 useSeoMeta({ title: 'Projects — Workboard', robots: 'noindex, nofollow' })
@@ -73,14 +85,21 @@ useSeoMeta({ title: 'Projects — Workboard', robots: 'noindex, nofollow' })
     <!-- status === 'idle' handling: see the same fix/comment in dashboard.vue -->
     <LoadingIndicator v-if="pending || status === 'idle'" label="Loading projects…" />
     <ErrorAlert v-else-if="error" :message="error.message" title="Could not load projects" />
-    <p v-else-if="!projects || projects.length === 0">No projects to show yet.</p>
+    <p v-else-if="response?.total === 0">No projects to show yet.</p>
+    <!-- Distinct from the true-zero case above: a real, non-empty list can
+         still land here if items were deleted out from under the page a
+         user is currently on (e.g. their only project on page 3 got
+         removed) - "no projects" would be actively wrong here since real
+         projects still exist, just not on this particular page. -->
+    <p v-else-if="projects.length === 0">No projects on this page.</p>
     <div v-else class="card-grid">
       <ProjectCard v-for="project in projects" :key="project.id" :project="project" />
     </div>
 
-    <p class="page-note">
-      Pagination demo (component proof only - see the comment above):
-    </p>
-    <PaginationControls v-model:current-page="demoPage" :total-pages="demoTotalPages" />
+    <PaginationControls
+      v-if="totalPages > 1"
+      v-model:current-page="currentPage"
+      :total-pages="totalPages"
+    />
   </div>
 </template>

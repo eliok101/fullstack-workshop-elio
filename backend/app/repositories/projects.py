@@ -14,19 +14,43 @@ def get_project_by_slug(db: Session, slug: str) -> Project | None:
     return db.execute(select(Project).where(Project.slug == slug)).scalar_one_or_none()
 
 
-def list_projects_visible_to_user(db: Session, user_id: int) -> list[Project]:
+def _visible_to_user_filter(user_id: int):
+    """Shared WHERE clause between the page query and its count, so the two
+    can never quietly drift apart (e.g. one gaining a visibility rule the
+    other doesn't, which would show a total that doesn't match what a user
+    can actually page through)."""
+    return or_(
+        Project.owner_id == user_id,
+        ProjectMember.user_id == user_id,
+    )
+
+
+def list_projects_visible_to_user(
+    db: Session, user_id: int, *, limit: int | None = None, offset: int = 0
+) -> list[Project]:
     stmt = (
         select(Project)
         .outerjoin(ProjectMember, ProjectMember.project_id == Project.id)
-        .where(
-            or_(
-                Project.owner_id == user_id,
-                ProjectMember.user_id == user_id,
-            )
-        )
+        .where(_visible_to_user_filter(user_id))
+        .order_by(Project.created_at.desc(), Project.id.desc())
         .distinct()
     )
+    if limit is not None:
+        stmt = stmt.limit(limit).offset(offset)
     return list(db.execute(stmt).scalars().all())
+
+
+def count_projects_visible_to_user(db: Session, user_id: int) -> int:
+    # DISTINCT count over the join, mirroring the list query's own .distinct()
+    # - without it, a project with more than one ProjectMember row would be
+    # counted once per membership row instead of once per project.
+    stmt = (
+        select(func.count(func.distinct(Project.id)))
+        .select_from(Project)
+        .outerjoin(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(_visible_to_user_filter(user_id))
+    )
+    return db.execute(stmt).scalar_one()
 
 
 def is_project_visible_to_user(db: Session, project: Project, user_id: int) -> bool:

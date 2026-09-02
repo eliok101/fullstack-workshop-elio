@@ -7,11 +7,18 @@
 // unauthenticated request.
 const api = useProjectsApi()
 
-const { data: projects, pending, status, error } = await useAsyncData(
+// GET /projects is real pagination now (see app/pages/projects/index.vue) -
+// the dashboard deliberately has no paging UI of its own, so it asks for
+// the largest allowed page instead: an "all your projects" overview, not
+// a paginated list. Genuinely wrong only past 100 projects for one user,
+// at which point this page's own no-pagination design is the real
+// decision to revisit, not this number.
+const { data: response, pending, status, error } = await useAsyncData(
   'dashboard-projects',
-  () => api.listProjects(),
+  () => api.listProjects({ page: 1, pageSize: 100 }),
   { server: false }
 )
+const projects = computed(() => response.value?.items ?? [])
 
 // Step 3/Step 1 table: protected, single-user, always-live data with no
 // crawlability requirement - noindex is defense in depth even though the
@@ -35,7 +42,7 @@ useSeoMeta({ title: 'Dashboard — Workboard', robots: 'noindex, nofollow' })
     -->
     <LoadingIndicator v-if="pending || status === 'idle'" label="Loading your projects…" />
     <ErrorAlert v-else-if="error" :message="error.message" title="Could not load projects" />
-    <p v-else-if="!projects || projects.length === 0">You don't have any projects yet.</p>
+    <p v-else-if="projects.length === 0">You don't have any projects yet.</p>
     <div v-else class="card-grid">
       <ProjectCard v-for="project in projects" :key="project.id" :project="project" />
     </div>

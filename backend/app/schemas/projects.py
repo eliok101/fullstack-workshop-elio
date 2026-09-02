@@ -44,3 +44,18 @@ class ProjectPublicListItem(BaseModel):
 
     slug: str
     updated_at: datetime
+
+
+class ProjectListResponse(BaseModel):
+    """Real pagination envelope for GET /projects - wires up
+    PaginationControls.vue, which had been sitting unused since it was
+    built ("may remain unused until task filtering/pagination is
+    implemented" - its own comment) because this endpoint had no page/limit
+    params yet. total_pages is precomputed here rather than left for the
+    client to derive, so there is exactly one source of truth for it."""
+
+    items: list[ProjectRead]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
