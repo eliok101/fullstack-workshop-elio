@@ -33,7 +33,39 @@ export default defineNuxtRouteMiddleware(async (to) => {
     return navigateTo({ path: '/login', query: { redirect: to.fullPath } })
   }
 
+  // Real bug, found live and root-caused with Vue's dev-mode hydration
+  // diagnostics: /login and /register always render as SSR guest pages (see
+  // the "Skips entirely on the server" note above), so an already
+  // authenticated visitor hard-landing on one of them has a real,
+  // server-sent DOM to hydrate first. Redirecting immediately here, on the
+  // very first client navigation, changes the router's target to /dashboard
+  // *before* Vue finishes hydrating the page the server actually sent - Vue
+  // then hydrates /dashboard's expected content against /register's real
+  // DOM nodes. Text/attribute mismatches from that are silently never
+  // corrected in production ("this mismatch is check-only... will not be
+  // rectified in production" - Vue's own warning), which is exactly why the
+  // header's Dashboard/Projects links kept the stale /login//register hrefs
+  // forever, confirmed live. PROTECTED_PREFIXES above doesn't need this
+  // same guard: /dashboard and /projects are ssr:false (routeRules), so
+  // there is never any real server-rendered content for a redirect away
+  // from them to conflict with. Deferring just this direction until
+  // hydration has actually finished lets the guest page hydrate honestly
+  // against what the server really sent - a clean, mismatch-free hydration
+  // - before this then runs as a completely normal, real client-side
+  // navigation. nuxtApp.isHydrating is the same flag Nuxt's own router
+  // plugin checks around middleware-driven navigation during hydration.
   if (GUEST_ONLY_PATHS.includes(to.path) && auth.isAuthenticated) {
+    const nuxtApp = useNuxtApp()
+    if (nuxtApp.isHydrating) {
+      // The hook callback must return HookResult (void), not navigateTo()'s
+      // own return value - unlike the middleware's own return below, this
+      // fires well after the current navigation has already resolved, so
+      // there is nothing here for Nuxt's router to act on.
+      nuxtApp.hooks.hookOnce('app:suspense:resolve', () => {
+        navigateTo('/dashboard')
+      })
+      return
+    }
     return navigateTo('/dashboard')
   }
 })
