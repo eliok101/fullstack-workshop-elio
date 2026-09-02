@@ -159,10 +159,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Real production bug, found live (a real registration attempt
+          # blocked by CORS right after a real deploy): Cloud Run gives every
+          # service two simultaneously-valid hostnames - the legacy
+          # per-revision-hash form (*-uc.a.run.app, ...) that
+          # `services describe`'s status.url/status.address.url always
+          # report, confirmed by dumping the full describe JSON and finding
+          # no other URL field anywhere - and a newer per-project-number form
+          # (*-PROJECT_NUMBER.REGION.run.app) that a real browser can just as
+          # legitimately be on. FRONTEND_URL above only ever captures the
+          # first. CORS is a literal Origin string match, so allow-listing
+          # only one silently locked out any real visitor on the other,
+          # exactly like this happened twice in a row against the live site
+          # before this fix. Allow both explicitly rather than trust
+          # `describe` to ever expose the second one.
+          PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+          FRONTEND_URL_ALT="https://${FRONTEND_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
           gcloud run services update "$BACKEND_SERVICE" \
             --region "$REGION" \
             --project "$PROJECT_ID" \
-            --update-env-vars "^@^CORS_ORIGINS=[\"${FRONTEND_URL}\"]" \
+            --update-env-vars "^@^CORS_ORIGINS=[\"${FRONTEND_URL}\",\"${FRONTEND_URL_ALT}\"]" \
             --quiet
 
       - name: Run production smoke checks
