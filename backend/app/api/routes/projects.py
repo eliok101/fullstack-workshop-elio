@@ -1,14 +1,20 @@
 """Project routes."""
 
-from fastapi import APIRouter, Depends, status
+import math
+
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.db.models import User
 from app.db.session import get_db
-from app.repositories.projects import list_projects_visible_to_user
+from app.repositories.projects import (
+    count_projects_visible_to_user,
+    list_projects_visible_to_user,
+)
 from app.schemas.projects import (
     ProjectCreate,
+    ProjectListResponse,
     ProjectPublicListItem,
     ProjectPublicSummary,
     ProjectRead,
@@ -26,12 +32,29 @@ from app.services.projects import (
 router = APIRouter(tags=["projects"])
 
 
-@router.get("/projects", response_model=list[ProjectRead])
+@router.get("/projects", response_model=ProjectListResponse)
 def list_projects(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-) -> list[ProjectRead]:
-    projects = list_projects_visible_to_user(db, current_user.id)
-    return [ProjectRead.model_validate(p) for p in projects]
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProjectListResponse:
+    total = count_projects_visible_to_user(db, current_user.id)
+    projects = list_projects_visible_to_user(
+        db, current_user.id, limit=page_size, offset=(page - 1) * page_size
+    )
+    # max(1, ...) so a genuinely empty list still reports "page 1 of 1"
+    # rather than "of 0" - PaginationControls treats total_pages as the
+    # last valid page, and 0 would make every page look simultaneously
+    # first and last in a way that's misleading rather than accurate.
+    total_pages = max(1, math.ceil(total / page_size))
+    return ProjectListResponse(
+        items=[ProjectRead.model_validate(p) for p in projects],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.post(

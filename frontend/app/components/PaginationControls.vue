@@ -5,10 +5,11 @@
  * decides what "page N" means for whatever list it's paginating - this
  * component only renders controls and announces the current position.
  *
- * Unused for now: docs/api-contract.md's project/task list endpoints don't
- * accept page/limit query params yet, so there's no real paginated list to
- * attach this to. Kept ready per the module's own allowance ("may remain
- * unused until task filtering/pagination is implemented").
+ * Real, wired-up usage: app/pages/projects/index.vue, since GET /projects
+ * accepts page/page_size (see docs/api-contract.md). Sat unused before that
+ * per the module's own allowance ("may remain unused until task filtering/
+ * pagination is implemented") - this component's own logic never changed
+ * to make it real, only the endpoint underneath it did.
  */
 const props = defineProps<{
   currentPage: number

@@ -41,6 +41,14 @@ export interface Project {
   updated_at: string
 }
 
+export interface ProjectListResponse {
+  items: Project[]
+  total: number
+  page: number
+  page_size: number
+  total_pages: number
+}
+
 export interface ProjectPublicSummary {
   name: string
   slug: string
